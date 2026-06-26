@@ -92,6 +92,15 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
   box-shadow: 0 2px 11px rgba(20, 40, 80, .15); padding: 5px 14px 5px 11px; font-size: 12px;
   font-weight: 500; color: var(--hype-accent); }
 
+/* ---- auto-pick map tooltip (follows the cursor; mirrors Leaflet.draw's .leaflet-draw-tooltip
+   so auto + manual modes feel cohesive — see www/reach_draw.js) ---- */
+.hype-pick-tooltip { position: fixed; z-index: 1400; pointer-events: none; white-space: nowrap;
+  background: rgba(0, 0, 0, .55); color: #fff; border-radius: 4px; padding: 4px 8px;
+  font: 12px/18px var(--font-body); box-shadow: 0 1px 4px rgba(0, 0, 0, .3); }
+.hype-pick-tooltip::before { content: ""; position: absolute; top: 7px; left: -7px;
+  border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+  border-right: 6px solid rgba(0, 0, 0, .55); }
+
 /* ---- busy / spinner ---- */
 .hype-busy { display: flex; align-items: center; gap: 8px; color: var(--hype-accent); font-size: 13px; margin: 10px 0; }
 .hype-spinner { width: 15px; height: 15px; border: 2px solid var(--hype-nav); border-top-color: var(--hype-accent);

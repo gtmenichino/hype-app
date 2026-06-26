@@ -65,7 +65,7 @@ LEFT_STYLE = {"color": "#1f6feb", "weight": 3, "opacity": 0.95}
 RIGHT_STYLE = {"color": "#d83933", "weight": 3, "opacity": 0.95}
 KZONE_STYLE = {"color": "#7b3fa0", "weight": 2, "opacity": 0.95, "fill": False}
 NHD_STYLE = {"color": "#00c2ff", "weight": 3.5, "opacity": 0.95}     # clickable NHD flowlines (bold)
-REACH_STYLE = {"color": "#00b3b3", "weight": 5, "opacity": 0.9}      # the traced analysis reach
+REACH_STYLE = {"color": "#ff2d95", "weight": 5, "opacity": 0.95}     # the analysis reach (magenta — pops on USGS topo, distinct from cyan NHD)
 CAP_STYLE = {"color": "#333333", "weight": 2, "opacity": 0.9, "dashArray": "6 5", "fill": False}
 
 STEP_REACH, STEP_DEM, STEP_BOUNDARIES, STEP_K, STEP_MESH, STEP_RUN, STEP_RESULTS = (
@@ -94,6 +94,7 @@ app_ui = ui.page_fillable(
                      href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"),
         ui.tags.link(rel="stylesheet", href="styles.css"),
         ui.tags.script(src="geocode.js"),
+        ui.tags.script(src="reach_draw.js"),
     ),
     ui.div(
         ui.div(
@@ -110,6 +111,7 @@ app_ui = ui.page_fillable(
         ui.div(ui.output_ui("leftpane"), class_="hype-leftpane"),
         ui.output_ui("readout"),
         ui.output_ui("flow_loading"),
+        ui.output_ui("reach_map_style"),
         class_="hype-shell",
     ),
     title="HYPE — Hyporheic Exchange Explorer",
@@ -374,7 +376,7 @@ def server(input, output, session):
                 position="topright",
                 polygon={"shapeOptions": {"color": "#caa700", "fillColor": "#fdf24a",
                                           "fillOpacity": 0.1}},
-                polyline={"shapeOptions": {"color": "#1f6feb", "weight": 4}},
+                polyline={"shapeOptions": {"color": "#ff2d95", "weight": 4}},
                 rectangle={}, circle={}, circlemarker={}, marker={},
             )
             _draw_ctl["dc"] = dc
@@ -1054,7 +1056,7 @@ def server(input, output, session):
                 "**How to use**\n\n"
                 "1. **Reach** — **Auto** (default): click the **upstream** then **downstream** "
                 "point on a blue NHD stream to trace the reach (≤ 1 mile). Or **Manual**: draw the "
-                "reach centerline (polyline tool) and enter the drainage area.\n"
+                "reach centerline (double-click the line to edit it) and enter the drainage area.\n"
                 "2. **DEM** — pick a 3DEP resolution and **Fetch terrain** over the reach.\n"
                 "3. **Boundaries** — the domain, left/right boundaries & wetted extent are generated "
                 "from cross-sections (floodplain = X × bankfull depth). Drag vertices to edit or "
@@ -1093,7 +1095,7 @@ def server(input, output, session):
                      "manual": "Manual — draw the centerline"}, selected=delineate_mode()),
                 ui.panel_conditional(
                     "input.delineate_mode === 'auto'",
-                    ui.div("Zoom to your stream, then click the upstream + downstream points.",
+                    ui.div("Zoom to your stream and pick the upstream + downstream points.",
                            class_="hype-instr"),
                     ui.output_ui("nhd_status_ui"),
                     ui.output_ui("auto_readout"),
@@ -1102,8 +1104,8 @@ def server(input, output, session):
                            class_="hype-actions")),
                 ui.panel_conditional(
                     "input.delineate_mode === 'manual'",
-                    ui.div("Draw the reach centerline (polyline tool), then enter its drainage area.",
-                           class_="hype-instr"),
+                    ui.div("Draw the reach centerline, then enter its drainage area. "
+                           "Double-click the line to edit it.", class_="hype-instr"),
                     ui.input_numeric("manual_da", "Drainage area (km²)", value=1.0, min=0.01,
                                      step=0.5),
                     ui.output_ui("manual_reach_status"),
@@ -1380,6 +1382,47 @@ def server(input, output, session):
             return None
         return ui.div(ui.div(class_="hype-spinner"), ui.span("Loading streams…"),
                       class_="hype-flow-loading")
+
+    @render.ui
+    def reach_map_style():
+        # On the Reach step the draw tool is auto-driven (see www/reach_draw.js), so hide its
+        # toolbar (the control stays in the DOM — we click its anchors; Leaflet.draw's mouse
+        # tooltip lives in the popup pane, so it still shows). Add a crosshair only while a pick
+        # or draw is actually possible. Mirrors EASI's cursor_style pattern.
+        if not _HAS_MAP or current_step() != STEP_REACH:
+            return None
+        css = ".hype-map-wrap .leaflet-draw{display:none !important;}"
+        z, _c = _view()
+        no_reach = reach_feat() is None
+        armed = delineate_mode() == "manual" and no_reach
+        picking = (delineate_mode() == "auto" and no_reach and z is not None
+                   and int(z) >= 12 and len(pick_pts()) < 2)
+        if armed or picking:
+            css += (".hype-map-wrap .leaflet-grab{cursor:crosshair !important;}"
+                    ".hype-map-wrap .leaflet-container.leaflet-dragging,"
+                    ".hype-map-wrap .leaflet-container.leaflet-dragging .leaflet-grab"
+                    "{cursor:grabbing !important;}")
+        return ui.tags.style(css)
+
+    @reactive.effect
+    async def _push_reach_state():
+        # Tell the client (www/reach_draw.js) how to guide the Reach-tab map: show the follow-
+        # cursor pick tooltip, auto-arm the polyline draw tool, and/or allow double-click-to-edit.
+        if not _HAS_MAP:
+            return
+        step = current_step()
+        mode = delineate_mode()
+        z, _c = _view()
+        no_reach = reach_feat() is None
+        on_reach = step == STEP_REACH
+        picking = (on_reach and mode == "auto" and no_reach and z is not None
+                   and int(z) >= 12 and len(pick_pts()) < 2)
+        await session.send_custom_message("hype_reach", {
+            "step": step,
+            "picking": bool(picking),
+            "arm": bool(on_reach and mode == "manual" and no_reach),
+            "canEdit": bool(on_reach and mode == "manual" and not no_reach),
+        })
 
 
 app = App(app_ui, server, static_assets=Path(__file__).parent / "www")
