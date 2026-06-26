@@ -31,8 +31,9 @@ tabulate>=0.9
 PyYAML>=6.0
 pydantic>=2
 
-# --- Figures (optional; the core can emit distribution plots) ---
+# --- Figures (the engine imports these at module level even when make_figures=False) ---
 matplotlib>=3.8
+seaborn>=0.12
 
 # --- The hyporheic engine (headless core) ---
 # VENDORED: the `hypetool` package is included in this repo (./hypetool), so no extra
