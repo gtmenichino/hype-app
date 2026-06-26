@@ -36,7 +36,8 @@ warnings.filterwarnings("ignore", message=r".*Widget\.widgets is deprecated.*")
 import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
-from hype_app import bieger, bundle, delineate, dem, estimate, geometry, hydro, results  # noqa: E402
+from hype_app import (bieger, bundle, delineate, dem, estimate, geocode, geometry, hydro,  # noqa: E402
+                      results)
 from hype_app import run as runner  # noqa: E402
 
 try:
@@ -92,6 +93,7 @@ app_ui = ui.page_fillable(
         ui.tags.link(rel="stylesheet",
                      href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"),
         ui.tags.link(rel="stylesheet", href="styles.css"),
+        ui.tags.script(src="geocode.js"),
     ),
     ui.div(
         ui.div(
@@ -107,6 +109,7 @@ app_ui = ui.page_fillable(
         ),
         ui.div(ui.output_ui("leftpane"), class_="hype-leftpane"),
         ui.output_ui("readout"),
+        ui.output_ui("flow_loading"),
         class_="hype-shell",
     ),
     title="HYPE — Hyporheic Exchange Explorer",
@@ -498,7 +501,7 @@ def server(input, output, session):
             return
         z, c = _view()
         if not c or z is None or int(z) < 12:
-            nhd_status.set("Zoom in (to ≈ zoom 12+) to load the NHD streams.")
+            nhd_status.set("Zoom in to load streams.")
             return
         lat, lon = float(c[0]), float(c[1])
         delta = min(0.08, 0.03 * (2 ** (15 - int(z))))   # half-box in degrees
@@ -507,7 +510,7 @@ def server(input, output, session):
         if not force and _flow.get("bbox") == bbox:      # already fetched this view
             return
         _flow["bbox"] = bbox
-        nhd_status.set("Loading NHD streams…")
+        nhd_status.set("")                 # the bottom "Loading streams…" spinner shows progress
         flow_task(bbox)
 
     @reactive.effect
@@ -517,16 +520,40 @@ def server(input, output, session):
         _do_flow_fetch()                                 # reads _view() → fires on pan/zoom
 
     @reactive.effect
-    @reactive.event(input.load_flow)
-    def _load_flow_btn():
-        _do_flow_fetch(force=True)
+    @reactive.event(input.address_pick)
+    def _on_address_pick():
+        # A suggestion was chosen in the type-ahead dropdown (coords come from the client-side
+        # Photon query in www/geocode.js) — recenter the map; _load_flowlines then auto-fetches
+        # the NHD streams at the new view.
+        if not _HAS_MAP:
+            return
+        p = input.address_pick() or {}
+        lat, lon = p.get("lat"), p.get("lon")
+        if lat is None or lon is None:
+            return
+        _MAP.center = (float(lat), float(lon))
+        _MAP.zoom = 15
+
+    @reactive.effect
+    @reactive.event(input.find_address)
+    def _find_address():
+        # Button fallback: geocode server-side (Photon → Nominatim) and recenter.
+        if not _HAS_MAP:
+            return
+        hit = geocode.geocode_address(_safe("address", ""))
+        if hit:
+            _MAP.center = (float(hit[0]), float(hit[1]))
+            _MAP.zoom = 15
+        else:
+            ui.notification_show("Place not found — try a city, address, or stream name.",
+                                 type="warning", duration=5)
 
     @reactive.effect
     def _flow_done():
         if flow_task.status() in ("initial", "running"):
             return
         if flow_task.status() == "error":
-            nhd_status.set("Could not load NHD streams (service/network issue).")
+            nhd_status.set("Couldn't load streams — try again.")
             try:
                 flow_task.result()
             except Exception as e:  # noqa: BLE001
@@ -544,9 +571,9 @@ def server(input, output, session):
                 _flow["gdf"] = gpd.GeoDataFrame.from_features(gj["features"], crs=4326)
             except Exception:  # noqa: BLE001
                 _flow["gdf"] = None
-            nhd_status.set(f"✓ {n} NHD stream segments — click the upstream then downstream point.")
+            nhd_status.set(f"✓ {n} streams — click the upstream + downstream points.")
         else:
-            nhd_status.set("No NHD streams in view — pan to a stream, or use Draw manually.")
+            nhd_status.set("No streams here — pan to a stream, or draw manually.")
 
     @reactive.extended_task
     async def snap_task(lat: float, lon: float) -> dict:
@@ -1063,26 +1090,29 @@ def server(input, output, session):
         step = current_step()
         if step == STEP_REACH:
             body = ui.TagList(
+                ui.input_text("address", "Address, place, or stream",
+                              placeholder="e.g. Atlanta, GA  ·  Utoy Creek"),
+                ui.div(ui.input_action_button("find_address", "Find on map",
+                                              class_="btn-sm btn-outline-secondary"),
+                       class_="hype-actions"),
+                ui.div("Type to search — suggestions from OpenStreetMap / Photon.",
+                       class_="hype-ac-credit"),
                 ui.input_radio_buttons(
                     "delineate_mode", "Define the reach",
                     {"auto": "Auto — pick 2 points on a stream",
                      "manual": "Manual — draw the centerline"}, selected=delineate_mode()),
                 ui.panel_conditional(
                     "input.delineate_mode === 'auto'",
-                    ui.div("Click the upstream point, then the downstream point, on a blue NHD "
-                           "stream. The reach (≤ 1 mile) is traced along the network.",
+                    ui.div("Zoom to your stream, then click the upstream + downstream points.",
                            class_="hype-instr"),
                     ui.output_ui("nhd_status_ui"),
                     ui.output_ui("auto_readout"),
-                    ui.div(ui.input_action_button("load_flow", "Load streams here",
-                                                  class_="btn-sm btn-outline-secondary"),
-                           ui.input_action_button("clear_points", "Clear",
+                    ui.div(ui.input_action_button("clear_points", "Clear",
                                                   class_="btn-sm btn-outline-secondary"),
                            class_="hype-actions")),
                 ui.panel_conditional(
                     "input.delineate_mode === 'manual'",
-                    ui.div("Draw the reach centerline with the polyline tool (upstream → "
-                           "downstream), then enter the drainage area at the downstream end.",
+                    ui.div("Draw the reach centerline (polyline tool), then enter its drainage area.",
                            class_="hype-instr"),
                     ui.input_numeric("manual_da", "Drainage area (km²)", value=1.0, min=0.01,
                                      step=0.5),
@@ -1095,8 +1125,7 @@ def server(input, output, session):
             )
         elif step == STEP_DEM:
             body = ui.TagList(
-                ui.div("Choose the source DEM resolution, then fetch USGS 3DEP terrain over the "
-                       "reach. Toggle \"DEM (hillshade)\" in the Layers control to inspect it.",
+                ui.div("Pick a resolution, then fetch 3DEP terrain over the reach.",
                        class_="hype-instr"),
                 ui.input_select("dem_res", "DEM resolution",
                                 {"auto": "Auto — finest (1 m where available)", "1": "1 m",
@@ -1110,8 +1139,7 @@ def server(input, output, session):
             )
         elif step == STEP_BOUNDARIES:
             body = ui.TagList(
-                ui.div("Review the generated domain, boundaries & wetted extent — drag vertices to "
-                       "edit, or draw your own. Refresh regenerates them from the floodplain "
+                ui.div("Drag vertices to edit, or Refresh to regenerate from the floodplain "
                        "multiplier.", class_="hype-instr"),
                 ui.input_select("fp_mult", "Floodplain extent = X × bankfull depth",
                                 {"2": "2×", "5": "5×", "10": "10× (default)"}, selected="10"),
@@ -1147,15 +1175,15 @@ def server(input, output, session):
             )
         elif step == STEP_K:
             body = ui.TagList(
-                ui.div("Hydraulic conductivity (m/day). Optionally draw K-zone polygons for "
-                       "high/low-K areas while on this step.", class_="hype-instr"),
+                ui.div("Hydraulic conductivity. Optionally draw K-zone polygons.",
+                       class_="hype-instr"),
                 ui.input_numeric("kh", "Horizontal K (m/d)", value=10.0, min=0.0001, step=1.0),
                 ui.input_numeric("kv", "Vertical K (m/d)", value=1.0, min=0.0001, step=0.5),
                 ui.input_numeric("porosity", "Porosity", value=0.3, min=0.01, max=0.6, step=0.05),
                 ui.input_checkbox("use_kzones", "Use hydraulic-conductivity zones", value=False),
                 ui.panel_conditional(
                     "input.use_kzones === true",
-                    ui.div("Draw K-zone polygon(s) on the map. Each uses these values:",
+                    ui.div("Draw K-zone polygon(s) — each uses these values:",
                            class_="hype-instr"),
                     ui.input_numeric("kzone_kh", "Zone KH (m/d)", value=50.0, min=0.0001, step=1.0),
                     ui.input_numeric("kzone_kv", "Zone KV (m/d)", value=5.0, min=0.0001, step=0.5),
@@ -1165,7 +1193,7 @@ def server(input, output, session):
             )
         elif step == STEP_MESH:
             body = ui.TagList(
-                ui.div("Model grid (metres / days). A live estimate keeps the run in bounds.",
+                ui.div("Model grid — the estimate keeps the run in bounds.",
                        class_="hype-instr"),
                 ui.input_numeric("cell_size", "Cell size (m)", value=10.0, min=1.0, step=1.0),
                 ui.input_numeric("gw_mod_depth", "Model depth (m)", value=6.0, min=1.0, step=0.5),
@@ -1197,9 +1225,7 @@ def server(input, output, session):
                     ui.output_ui("head_legend"),
                 ]
             body = ui.TagList(
-                ui.div("Run complete. Use the sliders for head layer & opacity; toggle any layer "
-                       "(Hydraulic head, Head contours, Model grid, Pathlines, Particle points, "
-                       "Domain, boundaries…) in the Layers control (top-right).",
+                ui.div("Run complete — adjust the sliders and toggle layers (top-right).",
                        class_="hype-instr"),
                 *head_ctrls,
                 ui.output_ui("result_summary"),
@@ -1348,11 +1374,23 @@ def server(input, output, session):
             return None
         z, c = _view()
         if not c:
-            return ui.div("Draw a domain to begin", class_="hype-readout")
+            return ui.div("Search or zoom to a stream to begin", class_="hype-readout")
         crs = proj_crs()
         crs_txt = f" · CRS {crs.to_epsg()}" if crs is not None and crs.to_epsg() else ""
         return ui.div(f"Zoom {int(z)} · {float(c[0]):.4f}, {float(c[1]):.4f}{crs_txt}",
                       class_="hype-readout")
+
+    @render.ui
+    def flow_loading():
+        # Bottom-center cue that the clickable NHD stream vectors are being fetched — only on the
+        # Reach step, zoomed in enough for them to appear, while a fetch is actually in flight.
+        if not _HAS_MAP or current_step() != STEP_REACH:
+            return None
+        z, _c = _view()
+        if z is None or int(z) < 12 or flow_task.status() != "running":
+            return None
+        return ui.div(ui.div(class_="hype-spinner"), ui.span("Loading streams…"),
+                      class_="hype-flow-loading")
 
 
 app = App(app_ui, server, static_assets=Path(__file__).parent / "www")
