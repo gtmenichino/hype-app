@@ -476,18 +476,8 @@ def server(input, output, session):
                                                name="DEM (hillshade)", opacity=0.8))
             except Exception as e:  # noqa: BLE001
                 ui.notification_show(f"DEM loaded; overlay render issue: {e}", duration=5)
-        # Chain into cross-section delineation for BOTH modes. Read inputs isolated so clearing
-        # reach_feat doesn't re-run this while the task is still "success".
-        with reactive.isolate():
-            rf = reach_feat()
-            meta = _reach_meta() or {}
-            x_mult = float(_safe("fp_mult", 10))
-        if rf is not None:
-            stage.set("Building cross-sections…")
-            delineate_task(rf, res["path"], meta.get("da_sqkm", 0.0),
-                           meta.get("lat"), meta.get("lon"), x_mult)
-        else:
-            ui.notification_show("Terrain ready.", duration=3)
+        # Terrain only — boundary delineation happens on the Boundaries tab ("Generate boundaries").
+        ui.notification_show("Terrain ready — continue to Boundaries.", duration=4)
 
     # ---- auto-delineation: NHD streams → pick 2 points → reach → cross-sections ----
     @reactive.extended_task
@@ -705,7 +695,7 @@ def server(input, output, session):
             ui.notification_show("Define a reach and fetch the DEM first.", type="warning", duration=5)
             return
         meta = _reach_meta() or {}
-        stage.set("Rebuilding cross-sections…")
+        stage.set("Building cross-sections…")
         delineate_task(reach_feat(), dem_path(), meta.get("da_sqkm", 0.0),
                        meta.get("lat"), meta.get("lon"), float(_safe("fp_mult", 10)))
 
@@ -1139,12 +1129,11 @@ def server(input, output, session):
             )
         elif step == STEP_BOUNDARIES:
             body = ui.TagList(
-                ui.div("Drag vertices to edit, or Refresh to regenerate from the floodplain "
-                       "multiplier.", class_="hype-instr"),
+                ui.div("Generate the domain & boundaries from the reach, then drag vertices to "
+                       "edit (Generate again after changing the multiplier).", class_="hype-instr"),
                 ui.input_select("fp_mult", "Floodplain extent = X × bankfull depth",
                                 {"2": "2×", "5": "5×", "10": "10× (default)"}, selected="10"),
-                ui.div(ui.input_action_button("regen", "Refresh boundaries",
-                                              class_="btn-sm btn-outline-secondary"),
+                ui.div(ui.input_action_button("regen", "Generate boundaries", class_="btn-primary"),
                        class_="hype-actions"),
                 ui.output_ui("draw_status"),
                 ui.input_radio_buttons(
@@ -1282,7 +1271,7 @@ def server(input, output, session):
                        class_="hype-chk ok" if ok else "hype-chk") for label, ok in seq]
         ready = all(ok for _, ok in seq)
         prompt = ui.div("All set — Continue to K." if ready else
-                        "Refresh to regenerate, or draw the missing pieces (polygon = "
+                        "Click Generate boundaries, or draw them manually (polygon = "
                         "domain / wetted extent, line = left / right).", class_="hype-instr")
         return ui.div(prompt, *rows)
 
