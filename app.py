@@ -67,10 +67,12 @@ NHD_STYLE = {"color": "#00c2ff", "weight": 3.5, "opacity": 0.95}     # clickable
 REACH_STYLE = {"color": "#00b3b3", "weight": 5, "opacity": 0.9}      # the traced analysis reach
 CAP_STYLE = {"color": "#333333", "weight": 2, "opacity": 0.9, "dashArray": "6 5", "fill": False}
 
-STEP_DOMAIN, STEP_TERRAIN, STEP_CONFIGURE, STEP_RUN, STEP_RESULTS = (
-    "domain", "terrain", "configure", "run", "results")
-STEP_LABELS = [(STEP_DOMAIN, "Define"), (STEP_CONFIGURE, "Configure"),
-               (STEP_RUN, "Run"), (STEP_RESULTS, "Results")]
+STEP_REACH, STEP_DEM, STEP_BOUNDARIES, STEP_K, STEP_MESH, STEP_RUN, STEP_RESULTS = (
+    "reach", "dem", "boundaries", "k", "mesh", "run", "results")
+STEP_LABELS = [(STEP_REACH, "Reach"), (STEP_DEM, "DEM"), (STEP_BOUNDARIES, "Boundaries"),
+               (STEP_K, "K"), (STEP_MESH, "Mesh"), (STEP_RUN, "Run"), (STEP_RESULTS, "Results")]
+# Steps where the user draws/edits shapes in the DrawControl (vs. static mirrored layers).
+EDIT_STEPS = (STEP_REACH, STEP_BOUNDARIES, STEP_K)
 
 BC_CORNER = "4 Corner Gradients"
 BC_PROFILE = "Spatially Varying Gradient"
@@ -125,7 +127,7 @@ def _stepper(active, reachable):
 def server(input, output, session):
     work_dir = Path(tempfile.mkdtemp(prefix="hype_session_"))
 
-    current_step = reactive.value(STEP_DOMAIN)
+    current_step = reactive.value(STEP_REACH)
     domain_feat = reactive.value(None)
     left_feat = reactive.value(None)
     right_feat = reactive.value(None)
@@ -252,52 +254,85 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             pass
 
-    @reactive.effect
-    def _sync_drawn_layers():
-        # In Define the shapes live in the DrawControl (editable) — don't mirror or clear there.
-        # On later steps, mirror each feature as a named, toggleable, thin layer + clear the
-        # DrawControl so it neither double-draws nor hides results under its fill.
-        if not _HAS_MAP:
-            return
-        names = ("Domain", "Water-surface extent", "Left boundary", "Right boundary")
-        if current_step() == STEP_DOMAIN:
-            for nm in names:
-                _set_layer(nm, None)
-            return
+    def _fc(feat):
+        return feat if (feat or {}).get("type") == "FeatureCollection" else {
+            "type": "FeatureCollection", "features": [feat]}
 
-        def _fc(feat):
-            return feat if (feat or {}).get("type") == "FeatureCollection" else {
-                "type": "FeatureCollection", "features": [feat]}
-        for nm, feat, style in zip(names, (domain_feat(), wse_extent_feat(),
-                                           left_feat(), right_feat()),
+    _MIRROR_NAMES = ("Domain", "Water-surface extent", "Left boundary", "Right boundary",
+                     "K-zones", "Reach")
+
+    def _mirror_features_as_layers():
+        """Show the geometry as named, toggleable, thin static layers (features read isolated)."""
+        with reactive.isolate():
+            dom, wse, lf, rf, kz, rch = (domain_feat(), wse_extent_feat(), left_feat(),
+                                         right_feat(), list(kzone_feats()), reach_feat())
+        for nm, feat, style in zip(("Domain", "Water-surface extent", "Left boundary",
+                                    "Right boundary"), (dom, wse, lf, rf),
                                    (DOMAIN_STYLE, WSE_STYLE, LEFT_STYLE, RIGHT_STYLE)):
             _set_layer(nm, GeoJSON(data=_fc(feat), style=style, name=nm) if feat else None)
-        kz = kzone_feats()
         _set_layer("K-zones", GeoJSON(data={"type": "FeatureCollection", "features": kz},
                                       style=KZONE_STYLE, name="K-zones") if kz else None)
+        _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
+
+    def _clear_mirror_layers():
+        for nm in _MIRROR_NAMES:
+            _set_layer(nm, None)
+
+    @reactive.effect
+    def _sync_map_shapes():
+        # Fires on STEP change only (features read isolated) so a user vertex-edit doesn't clobber
+        # the in-progress drawing. On an edit step (Reach/Boundaries/K) load that step's shapes into
+        # the DrawControl; on other steps clear the DrawControl + mirror features as static layers.
+        if not _HAS_MAP:
+            return
+        step = current_step()
         dc = _draw_ctl.get("dc")
-        if dc is not None:
-            try:
-                dc.clear()
-            except Exception:  # noqa: BLE001
-                pass
+        with reactive.isolate():
+            dom, wse, lf, rf = domain_feat(), wse_extent_feat(), left_feat(), right_feat()
+            kz = list(kzone_feats()); rch = reach_feat(); mode = delineate_mode()
+        if step in EDIT_STEPS:
+            _clear_mirror_layers()
+            if step == STEP_REACH:
+                ed = [rch] if (mode == "manual" and rch) else []
+                _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach")
+                           if (mode == "auto" and rch) else None)
+            elif step == STEP_BOUNDARIES:
+                ed = [f for f in (dom, wse, lf, rf) if f]
+                _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
+            else:                                            # STEP_K
+                ed = kz
+                _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
+            _load_into_drawcontrol(ed)
+        else:
+            if dc is not None:
+                try:
+                    dc.clear(); dc.data = []
+                except Exception:  # noqa: BLE001
+                    pass
+            _mirror_features_as_layers()
 
     def _reclassify_drawn():
-        """Re-derive the feature values from whatever shapes are currently in the DrawControl —
-        robust to auto-loaded shapes, manual draws, vertex edits, and deletes. In Configure,
-        polygons are K-zones; in Define, the largest polygon is the domain, the next is the
-        wetted extent (draw mode), and the two lines are the left/right boundaries (W→E)."""
+        """Re-derive the feature values from the DrawControl's current shapes, routed by step:
+        Reach (manual) → the drawn line is the reach centerline; K → polygons are K-zones;
+        Boundaries → largest polygon = domain, next = wetted extent, the two lines = left/right (W→E)."""
         from shapely.geometry import shape as _shape
         dc = _draw_ctl.get("dc")
         feats = list(getattr(dc, "data", None) or [])
         polys = [f for f in feats if (f.get("geometry") or {}).get("type") == "Polygon"]
         lines = [f for f in feats if (f.get("geometry") or {}).get("type") == "LineString"]
-        if current_step() == STEP_CONFIGURE:
+        step = current_step()
+        if step == STEP_REACH:
+            if delineate_mode() == "manual" and lines:
+                reach_feat.set(lines[0])
+            return
+        if step == STEP_K:
             kzone_feats.set(polys)
+            return
+        if step != STEP_BOUNDARIES:
             return
         polys.sort(key=lambda f: _shape(f["geometry"]).area, reverse=True)
         domain_feat.set(polys[0] if polys else None)
-        if wse_mode_v() == "draw":
+        if wse_mode_v() != "upload":
             wse_extent_feat.set(polys[1] if len(polys) > 1 else None)
 
         def _meanx(f):
@@ -377,16 +412,44 @@ def server(input, output, session):
                     "source": info["source"], "summary": dem.dem_summary(info["path"])}
         return await anyio.to_thread.run_sync(_work)
 
+    def _reach_meta():
+        """Drainage area + midpoint + Bieger bankfull geometry for the current reach. AUTO reads
+        the NHD-derived auto_meta; MANUAL derives it from the drawn centerline + the user's
+        Drainage-area input. Returns None if there's no reach yet."""
+        if delineate_mode() != "manual":
+            return auto_meta()
+        rf = reach_feat()
+        if rf is None:
+            return None
+        import geopandas as gpd
+        from shapely.geometry import shape as _shape
+        da = float(_safe("manual_da", 1.0))
+        line = _shape(rf["geometry"])
+        mid = line.interpolate(0.5, normalized=True)
+        try:
+            length_m = float(gpd.GeoSeries([line], crs=4326).to_crs(5070).length.iloc[0])
+        except Exception:  # noqa: BLE001
+            length_m = 0.0
+        bf = bieger.bankfull_geometry(da, mid.y, mid.x)
+        return {"da_sqkm": da, "length_m": length_m, "lat": float(mid.y),
+                "lon": float(mid.x), **bf}
+
     @reactive.effect
-    @reactive.event(domain_feat)
-    def _autofetch_dem():
-        # MANUAL mode only: download the DEM over the drawn domain so it can back the wetted-extent
-        # tracing. (In AUTO mode the DEM is fetched over the traced reach — see _fetch_dem_for_reach
-        # — and the domain is *generated* from it, so fetching on the generated domain would loop.)
-        if delineate_mode() != "manual" or domain_feat() is None:
+    @reactive.event(input.fetch_dem)
+    def _fetch_dem():
+        rf = reach_feat()
+        if rf is None:
+            ui.notification_show("Define a reach first (Reach tab).", type="warning", duration=5)
             return
-        stage.set("Downloading 3DEP terrain…")
-        dem_task(domain_feat(), str(work_dir / "inputs" / "dem.tif"), _safe("dem_res", "auto"))
+        import geopandas as gpd
+        from shapely.geometry import mapping, shape as _shape
+        meta = _reach_meta() or {}
+        half = min(max(8.0 * max(meta.get("width_m", 1.0), 1.0), 250.0), 800.0)
+        buf = (gpd.GeoSeries([_shape(rf["geometry"])], crs=4326).to_crs(5070)
+               .buffer(half + 60.0).to_crs(4326).iloc[0])
+        stage.set("Downloading 3DEP terrain for the reach…")
+        dem_task({"type": "Feature", "properties": {}, "geometry": mapping(buf)},
+                 str(work_dir / "inputs" / "dem.tif"), _safe("dem_res", "auto"))
 
     @reactive.effect
     def _dem_done():
@@ -403,22 +466,20 @@ def server(input, output, session):
             return
         dem_path.set(res["path"])
         dem_meta.set({"resolution_m": res.get("resolution_m"), "source": res.get("source")})
-        if _HAS_MAP:                       # hillshade backdrop for tracing the wetted extent
+        if _HAS_MAP:                       # hillshade backdrop
             try:
                 ov = dem.dem_overlay(res["path"])
                 _set_layer("dem", ImageOverlay(url=ov["url"], bounds=ov["bounds"],
                                                name="DEM (hillshade)", opacity=0.8))
             except Exception as e:  # noqa: BLE001
                 ui.notification_show(f"DEM loaded; overlay render issue: {e}", duration=5)
-        # Read the chaining inputs WITHOUT subscribing to them — otherwise clearing reach_feat
-        # ("Clear points") would re-run _dem_done while the task is still "success" and re-add the
-        # DEM we just removed. _dem_done should react only to the dem_task completing.
+        # Chain into cross-section delineation for BOTH modes. Read inputs isolated so clearing
+        # reach_feat doesn't re-run this while the task is still "success".
         with reactive.isolate():
             rf = reach_feat()
-            chain = delineate_mode() == "auto" and rf is not None
-            meta = auto_meta() or {}
+            meta = _reach_meta() or {}
             x_mult = float(_safe("fp_mult", 10))
-        if chain:
+        if rf is not None:
             stage.set("Building cross-sections…")
             delineate_task(rf, res["path"], meta.get("da_sqkm", 0.0),
                            meta.get("lat"), meta.get("lon"), x_mult)
@@ -451,7 +512,7 @@ def server(input, output, session):
 
     @reactive.effect
     def _load_flowlines():
-        if delineate_mode() != "auto" or current_step() != STEP_DOMAIN:
+        if delineate_mode() != "auto" or current_step() != STEP_REACH:
             return
         _do_flow_fetch()                                 # reads _view() → fires on pan/zoom
 
@@ -573,22 +634,6 @@ def server(input, output, session):
                              f"{r['da_sqkm']:.1f} km² · bankfull depth {bf['depth_m']:.2f} m "
                              f"({bf['division_name']}). Fetching terrain…", duration=7)
 
-    @reactive.effect
-    @reactive.event(reach_feat)
-    def _fetch_dem_for_reach():
-        rf = reach_feat()
-        if rf is None or delineate_mode() != "auto":
-            return
-        import geopandas as gpd
-        from shapely.geometry import mapping, shape
-        meta = auto_meta() or {}
-        half = min(max(8.0 * max(meta.get("width_m", 1.0), 1.0), 250.0), 800.0)
-        buf = (gpd.GeoSeries([shape(rf["geometry"])], crs=4326).to_crs(5070)
-               .buffer(half + 60.0).to_crs(4326).iloc[0])
-        stage.set("Downloading 3DEP terrain for the reach…")
-        dem_task({"type": "Feature", "properties": {}, "geometry": mapping(buf)},
-                 str(work_dir / "inputs" / "dem.tif"), _safe("dem_res", "auto"))
-
     @reactive.extended_task
     async def delineate_task(reach, dem_p, da, lat, lon, x_mult) -> dict:
         return await anyio.to_thread.run_sync(
@@ -613,20 +658,26 @@ def server(input, output, session):
             return
         domain_feat.set(d["domain"]); left_feat.set(d["left"]); right_feat.set(d["right"])
         wse_extent_feat.set(d["wse_extent"]); wse_mode_v.set("draw")
-        _load_into_drawcontrol([d["domain"], d["wse_extent"], d["left"], d["right"]])
         for nm, key in (("Upstream cap", "up_cap"), ("Downstream cap", "down_cap")):
             f = d.get(key)
             _set_layer(nm, GeoJSON(data={"type": "FeatureCollection", "features": [f]},
                                    style=CAP_STYLE, name=nm) if f else None)
-        ui.notification_show("Domain, boundaries & wetted extent generated — review and edit on the "
-                             "map (drag vertices), then Continue.", duration=8)
+        with reactive.isolate():
+            on_boundaries = current_step() == STEP_BOUNDARIES
+        if on_boundaries:                      # refresh while editing → reload the editable shapes
+            _load_into_drawcontrol([d["domain"], d["wse_extent"], d["left"], d["right"]])
+        else:                                  # generated before reaching Boundaries → show statics
+            _mirror_features_as_layers()
+        ui.notification_show("Domain, boundaries & wetted extent generated — open the Boundaries tab "
+                             "to review/edit (drag vertices).", duration=8)
 
     @reactive.effect
-    @reactive.event(input.fp_mult, input.regen)
+    @reactive.event(input.regen)
     def _regenerate():
-        if delineate_mode() != "auto" or reach_feat() is None or dem_path() is None:
+        if reach_feat() is None or dem_path() is None:
+            ui.notification_show("Define a reach and fetch the DEM first.", type="warning", duration=5)
             return
-        meta = auto_meta() or {}
+        meta = _reach_meta() or {}
         stage.set("Rebuilding cross-sections…")
         delineate_task(reach_feat(), dem_path(), meta.get("da_sqkm", 0.0),
                        meta.get("lat"), meta.get("lon"), float(_safe("fp_mult", 10)))
@@ -807,7 +858,7 @@ def server(input, output, session):
                     msg = f"Model run failed: {detail}"
             log_lines.append(msg); log_tick.set(len(log_lines))
             ui.notification_show(msg, type="error", duration=12)
-            current_step.set(STEP_CONFIGURE)
+            current_step.set(STEP_MESH)
             return
         try:
             res = run_task.result()
@@ -880,16 +931,18 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             pass
         stage.set("")
-        current_step.set(STEP_CONFIGURE)
+        current_step.set(STEP_MESH)
         ui.notification_show("Run cancelled.", type="warning", duration=4)
 
     # ---- navigation ----
     def _reachable():
-        r = {STEP_DOMAIN}
-        draw = wse_mode_v() == "draw"
-        if (domain_feat() and left_feat() and right_feat() and dem_path()
-                and (wse_extent_feat() or not draw)):
-            r.add(STEP_CONFIGURE)
+        r = {STEP_REACH}
+        if reach_feat() is not None:
+            r.add(STEP_DEM)
+        if dem_path() is not None:
+            r.add(STEP_BOUNDARIES)
+        if domain_feat() and left_feat() and right_feat():
+            r.update({STEP_K, STEP_MESH})
         if run_result() is not None:
             r.update({STEP_RUN, STEP_RESULTS})
         return r
@@ -905,15 +958,18 @@ def server(input, output, session):
                 current_step.set(key)
 
     @reactive.effect
-    @reactive.event(input.to_configure)
-    def _to_configure():
-        draw = wse_mode_v() == "draw"
-        if (domain_feat() and left_feat() and right_feat() and dem_path()
-                and (wse_extent_feat() or not draw)):
-            current_step.set(STEP_CONFIGURE)
+    @reactive.event(input.go_next)
+    def _go_next():
+        order = [k for k, _ in STEP_LABELS]
+        cur = current_step()
+        i = order.index(cur) if cur in order else 0
+        if i + 1 >= len(order):
+            return
+        nxt = order[i + 1]
+        if nxt in _reachable():
+            current_step.set(nxt)
         else:
-            ui.notification_show("Finish the Define step first — see the checklist.",
-                                 type="warning", duration=4)
+            ui.notification_show("Finish this step first.", type="warning", duration=4)
 
     def _clear_auto_picks():
         pick_pts.set([]); reach_feat.set(None); auto_meta.set(None); last_click.set(None)
@@ -962,7 +1018,7 @@ def server(input, output, session):
                 pass
         for k in list(_layers):
             _set_layer(k, None)
-        current_step.set(STEP_DOMAIN)
+        current_step.set(STEP_REACH)
 
     @reactive.effect
     @reactive.event(input.nav_help)
@@ -970,15 +1026,18 @@ def server(input, output, session):
         ui.modal_show(ui.modal(
             ui.markdown(
                 "**How to use**\n\n"
-                "1. **Define** — **Auto-delineate** (default): click the **upstream** then "
-                "**downstream** point on a blue NHD stream; the reach (≤ 1 mile) is traced and the "
-                "**domain**, **boundaries** & **wetted extent** are generated from cross-sections "
-                "sized by drainage area + Bieger bankfull depth (floodplain = X × bankfull depth, "
-                "X = 2/5/10). Drag vertices to revise, or switch to **Draw manually**. The 3DEP "
-                "DEM loads as a toggleable hillshade.\n"
-                "2. **Configure** parameters (a live estimate keeps the grid in bounds). Optional: "
-                "turn on K-zones and draw extra polygons for high/low-K areas.\n"
-                "3. **Run**, then **Results**: pathlines + points draw on the map; download the bundle.\n\n"
+                "1. **Reach** — **Auto** (default): click the **upstream** then **downstream** "
+                "point on a blue NHD stream to trace the reach (≤ 1 mile). Or **Manual**: draw the "
+                "reach centerline (polyline tool) and enter the drainage area.\n"
+                "2. **DEM** — pick a 3DEP resolution and **Fetch terrain** over the reach.\n"
+                "3. **Boundaries** — the domain, left/right boundaries & wetted extent are generated "
+                "from cross-sections (floodplain = X × bankfull depth). Drag vertices to edit or "
+                "**Refresh** to regenerate; set the boundary-condition gradients here.\n"
+                "4. **K** — horizontal/vertical conductivity & porosity; optionally draw K-zone "
+                "polygons.\n"
+                "5. **Mesh** — cell size, model depth & layer thickness (a live estimate keeps the "
+                "grid in bounds), then **Run model**.\n"
+                "6. **Run** → **Results**: pathlines + heads draw on the map; download the bundle.\n\n"
                 "The water-surface extent becomes the constant-head (CHD) top boundary, using the "
                 "DEM elevations inside it. Results live in temporary storage — **download before you leave**."),
             title="Help", easy_close=True))
@@ -993,35 +1052,64 @@ def server(input, output, session):
     @render.ui
     def leftpane():
         step = current_step()
-        if step == STEP_DOMAIN:
+        if step == STEP_REACH:
             body = ui.TagList(
                 ui.input_radio_buttons(
                     "delineate_mode", "Define the reach",
-                    {"auto": "Auto-delineate (pick 2 points on a stream)",
-                     "manual": "Draw manually"}, selected=delineate_mode()),
+                    {"auto": "Auto — pick 2 points on a stream",
+                     "manual": "Manual — draw the centerline"}, selected=delineate_mode()),
                 ui.panel_conditional(
                     "input.delineate_mode === 'auto'",
                     ui.div("Click the upstream point, then the downstream point, on a blue NHD "
-                           "stream. The reach (≤ 1 mile) is traced along the stream and the domain, "
-                           "boundaries & wetted extent are generated from cross-sections — then "
-                           "drag vertices on the map to revise before continuing.",
+                           "stream. The reach (≤ 1 mile) is traced along the network.",
                            class_="hype-instr"),
                     ui.output_ui("nhd_status_ui"),
-                    ui.input_select("fp_mult", "Floodplain extent = X × bankfull depth",
-                                    {"2": "2×", "5": "5×", "10": "10× (default)"}, selected="10"),
                     ui.output_ui("auto_readout"),
                     ui.div(ui.input_action_button("load_flow", "Load streams here",
                                                   class_="btn-sm btn-outline-secondary"),
-                           ui.input_action_button("clear_points", "Clear points",
-                                                  class_="btn-sm btn-outline-secondary"),
-                           ui.input_action_button("regen", "Regenerate",
+                           ui.input_action_button("clear_points", "Clear",
                                                   class_="btn-sm btn-outline-secondary"),
                            class_="hype-actions")),
                 ui.panel_conditional(
                     "input.delineate_mode === 'manual'",
-                    ui.div("Draw the inputs in order (the checklist shows what's next). After the "
-                           "domain, the DEM auto-downloads — toggle \"DEM (hillshade)\" to trace "
-                           "the wetted extent against the aerial.", class_="hype-instr")),
+                    ui.div("Draw the reach centerline with the polyline tool (upstream → "
+                           "downstream), then enter the drainage area at the downstream end.",
+                           class_="hype-instr"),
+                    ui.input_numeric("manual_da", "Drainage area (km²)", value=1.0, min=0.01,
+                                     step=0.5),
+                    ui.output_ui("manual_reach_status"),
+                    ui.div(ui.input_action_button("clear_draw", "Clear",
+                                                  class_="btn-sm btn-outline-secondary"),
+                           class_="hype-actions")),
+                ui.div(ui.input_action_button("go_next", "Continue → DEM", class_="btn-primary"),
+                       class_="hype-actions"),
+            )
+        elif step == STEP_DEM:
+            body = ui.TagList(
+                ui.div("Choose the source DEM resolution, then fetch USGS 3DEP terrain over the "
+                       "reach. Toggle \"DEM (hillshade)\" in the Layers control to inspect it.",
+                       class_="hype-instr"),
+                ui.input_select("dem_res", "DEM resolution",
+                                {"auto": "Auto — finest (1 m where available)", "1": "1 m",
+                                 "3": "3 m", "5": "5 m", "10": "10 m"}, selected="auto"),
+                ui.div(ui.input_action_button("fetch_dem", "Fetch terrain", class_="btn-primary"),
+                       class_="hype-actions"),
+                ui.output_ui("busy"),
+                ui.output_ui("dem_status"),
+                ui.div(ui.input_action_button("go_next", "Continue → Boundaries",
+                                              class_="btn-primary"), class_="hype-actions"),
+            )
+        elif step == STEP_BOUNDARIES:
+            body = ui.TagList(
+                ui.div("Review the generated domain, boundaries & wetted extent — drag vertices to "
+                       "edit, or draw your own. Refresh regenerates them from the floodplain "
+                       "multiplier.", class_="hype-instr"),
+                ui.input_select("fp_mult", "Floodplain extent = X × bankfull depth",
+                                {"2": "2×", "5": "5×", "10": "10× (default)"}, selected="10"),
+                ui.div(ui.input_action_button("regen", "Refresh boundaries",
+                                              class_="btn-sm btn-outline-secondary"),
+                       class_="hype-actions"),
+                ui.output_ui("draw_status"),
                 ui.input_radio_buttons(
                     "wse_mode", "Water surface (top boundary)",
                     {"draw": "Wetted extent (auto / drawn)", "upload": "Upload a WSE raster"},
@@ -1030,25 +1118,6 @@ def server(input, output, session):
                     "input.wse_mode === 'upload'",
                     ui.input_file("wse_upload", "WSE GeoTIFF", accept=[".tif", ".tiff"],
                                   multiple=False)),
-                ui.input_select("dem_res", "DEM resolution",
-                                {"auto": "Auto — finest (1 m where available)", "1": "1 m",
-                                 "3": "3 m", "5": "5 m", "10": "10 m"}, selected="auto"),
-                ui.output_ui("draw_status"),
-                ui.output_ui("busy"),
-                ui.output_ui("dem_status"),
-                ui.div(ui.input_action_button("clear_draw", "Clear", class_="btn-sm btn-outline-secondary"),
-                       ui.input_action_button("to_configure", "Continue", class_="btn-primary"),
-                       class_="hype-actions"),
-            )
-        elif step == STEP_CONFIGURE:
-            body = ui.TagList(
-                ui.div("Model parameters (metres / days).", class_="hype-instr"),
-                ui.input_numeric("cell_size", "Cell size (m)", value=10.0, min=1.0, step=1.0),
-                ui.input_numeric("gw_mod_depth", "Model depth (m)", value=6.0, min=1.0, step=0.5),
-                ui.input_numeric("z", "Layer thickness (m)", value=0.25, min=0.05, step=0.05),
-                ui.input_numeric("kh", "Horizontal K (m/d)", value=10.0, min=0.0001, step=1.0),
-                ui.input_numeric("kv", "Vertical K (m/d)", value=1.0, min=0.0001, step=0.5),
-                ui.input_numeric("porosity", "Porosity", value=0.3, min=0.01, max=0.6, step=0.05),
                 ui.input_select("bc_mode", "Boundary condition",
                                 {BC_CORNER: "4 corner gradients", BC_PROFILE: "Spatially varying"},
                                 selected=BC_CORNER),
@@ -1064,14 +1133,34 @@ def server(input, output, session):
                     ui.input_text("g_right_profile", "Right profile", value="0,0.005 0.5,0.005 1,0.005"),
                     ui.div("Format: 'fraction,gradient …' along each boundary (must include 0 and 1).",
                            class_="hype-instr")),
+                ui.div(ui.input_action_button("go_next", "Continue → K", class_="btn-primary"),
+                       class_="hype-actions"),
+            )
+        elif step == STEP_K:
+            body = ui.TagList(
+                ui.div("Hydraulic conductivity (m/day). Optionally draw K-zone polygons for "
+                       "high/low-K areas while on this step.", class_="hype-instr"),
+                ui.input_numeric("kh", "Horizontal K (m/d)", value=10.0, min=0.0001, step=1.0),
+                ui.input_numeric("kv", "Vertical K (m/d)", value=1.0, min=0.0001, step=0.5),
+                ui.input_numeric("porosity", "Porosity", value=0.3, min=0.01, max=0.6, step=0.05),
                 ui.input_checkbox("use_kzones", "Use hydraulic-conductivity zones", value=False),
                 ui.panel_conditional(
                     "input.use_kzones === true",
-                    ui.div("Draw K-zone polygon(s) on the map while on this step. Each uses these:",
+                    ui.div("Draw K-zone polygon(s) on the map. Each uses these values:",
                            class_="hype-instr"),
                     ui.input_numeric("kzone_kh", "Zone KH (m/d)", value=50.0, min=0.0001, step=1.0),
                     ui.input_numeric("kzone_kv", "Zone KV (m/d)", value=5.0, min=0.0001, step=0.5),
                     ui.output_ui("kzone_status")),
+                ui.div(ui.input_action_button("go_next", "Continue → Mesh", class_="btn-primary"),
+                       class_="hype-actions"),
+            )
+        elif step == STEP_MESH:
+            body = ui.TagList(
+                ui.div("Model grid (metres / days). A live estimate keeps the run in bounds.",
+                       class_="hype-instr"),
+                ui.input_numeric("cell_size", "Cell size (m)", value=10.0, min=1.0, step=1.0),
+                ui.input_numeric("gw_mod_depth", "Model depth (m)", value=6.0, min=1.0, step=0.5),
+                ui.input_numeric("z", "Layer thickness (m)", value=0.25, min=0.05, step=0.05),
                 ui.output_ui("estimate_box"),
                 ui.div(ui.input_action_button("run_model", "Run model", class_="btn-primary"),
                        class_="hype-actions"),
@@ -1142,44 +1231,24 @@ def server(input, output, session):
         return ui.div(*rows)
 
     @render.ui
+    def manual_reach_status():
+        ok = delineate_mode() == "manual" and reach_feat() is not None
+        return ui.div(("✓ Reach centerline drawn" if ok else "○ Draw the reach centerline"),
+                      class_="hype-chk ok" if ok else "hype-chk")
+
+    @render.ui
     def draw_status():
-        dem_busy = dem_task.status() == "running"
-        dem_ready = dem_path() is not None
-        seq = [("Domain polygon", domain_feat() is not None, False)]
-        dem_lbl = ("Terrain DEM (downloading…)" if dem_busy
-                   else "Terrain DEM" if dem_ready
-                   else "Terrain DEM (auto-loads after the domain)")
-        seq.append((dem_lbl, dem_ready, dem_busy))
-        if wse_mode_v() == "draw":
-            seq.append(("Water-surface extent polygon", wse_extent_feat() is not None, False))
-        seq += [("Left boundary line", left_feat() is not None, False),
-                ("Right boundary line", right_feat() is not None, False)]
-        nxt = next((i for i, (_l, ok, busy) in enumerate(seq) if not ok and not busy), None)
-
-        def row(i, label, ok, busy):
-            mark = "✓ " if ok else ("⏳ " if busy else ("➤ " if i == nxt else "○ "))
-            return ui.div(mark + label, class_="hype-chk ok" if ok else "hype-chk")
-        rows = [row(i, l, ok, busy) for i, (l, ok, busy) in enumerate(seq)]
-
-        if delineate_mode() == "auto":
-            ready = bool(domain_feat() and left_feat() and right_feat()
-                         and (wse_extent_feat() or wse_mode_v() != "draw"))
-            prompt = ui.div("Generated — drag vertices on the map to revise, then Continue."
-                            if ready else "Pick the upstream & downstream points to generate.",
-                            class_="hype-instr")
-        elif dem_busy:
-            prompt = ui.div("Downloading terrain…", class_="hype-instr")
-        elif nxt is None:
-            prompt = ui.div("All inputs ready — continue to Configure.", class_="hype-instr")
-        else:
-            lbl = seq[nxt][0]
-            if "extent" in lbl.lower():
-                prompt = ui.div("Next: draw the wetted extent (polygon) — toggle the DEM layer "
-                                "to see the water surface.", class_="hype-instr")
-            elif "line" in lbl.lower():
-                prompt = ui.div(f"Next: draw the {lbl.lower()} (line tool).", class_="hype-instr")
-            else:
-                prompt = ui.div(f"Next: draw the {lbl.lower()} (polygon tool).", class_="hype-instr")
+        seq = [("Domain polygon", domain_feat() is not None)]
+        if wse_mode_v() != "upload":
+            seq.append(("Water-surface extent", wse_extent_feat() is not None))
+        seq += [("Left boundary line", left_feat() is not None),
+                ("Right boundary line", right_feat() is not None)]
+        rows = [ui.div(("✓ " if ok else "○ ") + label,
+                       class_="hype-chk ok" if ok else "hype-chk") for label, ok in seq]
+        ready = all(ok for _, ok in seq)
+        prompt = ui.div("All set — Continue to K." if ready else
+                        "Refresh to regenerate, or draw the missing pieces (polygon = "
+                        "domain / wetted extent, line = left / right).", class_="hype-instr")
         return ui.div(prompt, *rows)
 
     @render.ui
