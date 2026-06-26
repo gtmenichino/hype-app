@@ -957,19 +957,28 @@ def server(input, output, session):
             if n and key in _reachable():
                 current_step.set(key)
 
+    _nav_seen: dict = {}
+
     @reactive.effect
-    @reactive.event(input.go_next)
-    def _go_next():
-        order = [k for k, _ in STEP_LABELS]
-        cur = current_step()
-        i = order.index(cur) if cur in order else 0
-        if i + 1 >= len(order):
-            return
-        nxt = order[i + 1]
-        if nxt in _reachable():
-            current_step.set(nxt)
-        else:
-            ui.notification_show("Finish this step first.", type="warning", duration=4)
+    def _continue_nav():
+        # Per-tab "Continue" buttons use DISTINCT ids + a strict-increment guard so a button-count
+        # reset on a leftpane re-render can't spuriously re-fire navigation (the shared-go_next
+        # footgun: @reactive.event fired on the 1→0 reset and tried to advance an extra step).
+        reach = _reachable()
+        for bid, tgt in (("next_reach", STEP_DEM), ("next_dem", STEP_BOUNDARIES),
+                         ("next_boundaries", STEP_K), ("next_k", STEP_MESH)):
+            try:
+                n = int(input[bid]() or 0)
+            except Exception:  # noqa: BLE001
+                n = 0
+            last = _nav_seen.get(bid, 0)
+            if n != last:
+                _nav_seen[bid] = n
+                if n > last:                          # a real click (not a re-render reset)
+                    if tgt in reach:
+                        current_step.set(tgt)
+                    else:
+                        ui.notification_show("Finish this step first.", type="warning", duration=4)
 
     def _clear_auto_picks():
         pick_pts.set([]); reach_feat.set(None); auto_meta.set(None); last_click.set(None)
@@ -1081,7 +1090,7 @@ def server(input, output, session):
                     ui.div(ui.input_action_button("clear_draw", "Clear",
                                                   class_="btn-sm btn-outline-secondary"),
                            class_="hype-actions")),
-                ui.div(ui.input_action_button("go_next", "Continue → DEM", class_="btn-primary"),
+                ui.div(ui.input_action_button("next_reach", "Continue → DEM", class_="btn-primary"),
                        class_="hype-actions"),
             )
         elif step == STEP_DEM:
@@ -1096,7 +1105,7 @@ def server(input, output, session):
                        class_="hype-actions"),
                 ui.output_ui("busy"),
                 ui.output_ui("dem_status"),
-                ui.div(ui.input_action_button("go_next", "Continue → Boundaries",
+                ui.div(ui.input_action_button("next_dem", "Continue → Boundaries",
                                               class_="btn-primary"), class_="hype-actions"),
             )
         elif step == STEP_BOUNDARIES:
@@ -1133,7 +1142,7 @@ def server(input, output, session):
                     ui.input_text("g_right_profile", "Right profile", value="0,0.005 0.5,0.005 1,0.005"),
                     ui.div("Format: 'fraction,gradient …' along each boundary (must include 0 and 1).",
                            class_="hype-instr")),
-                ui.div(ui.input_action_button("go_next", "Continue → K", class_="btn-primary"),
+                ui.div(ui.input_action_button("next_boundaries", "Continue → K", class_="btn-primary"),
                        class_="hype-actions"),
             )
         elif step == STEP_K:
@@ -1151,7 +1160,7 @@ def server(input, output, session):
                     ui.input_numeric("kzone_kh", "Zone KH (m/d)", value=50.0, min=0.0001, step=1.0),
                     ui.input_numeric("kzone_kv", "Zone KV (m/d)", value=5.0, min=0.0001, step=0.5),
                     ui.output_ui("kzone_status")),
-                ui.div(ui.input_action_button("go_next", "Continue → Mesh", class_="btn-primary"),
+                ui.div(ui.input_action_button("next_k", "Continue → Mesh", class_="btn-primary"),
                        class_="hype-actions"),
             )
         elif step == STEP_MESH:
