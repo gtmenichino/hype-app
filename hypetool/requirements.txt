@@ -1,0 +1,31 @@
+﻿# hypetool runtime dependencies
+# Install with: pip install -r src/hypetool/requirements.txt
+
+# Core
+numpy
+scipy
+pandas
+matplotlib
+seaborn
+shapely
+pyproj
+rasterio
+geopandas
+pydantic>=2
+PyYAML
+tabulate
+flopy
+modflow-devtools
+
+# NetCDF support (required)
+xarray
+netCDF4
+
+# Tests & dev tools (optional)
+# pytest
+# pytest-cov
+# ruff
+# black
+# mypy
+# pre-commit
+

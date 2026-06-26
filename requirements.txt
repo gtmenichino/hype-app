@@ -1,0 +1,41 @@
+# Hyporheic web app — runtime dependencies (manylinux wheels only; pip-only, no apt).
+# Posit Connect Cloud installs from this file. Based on the EASI stack proven on
+# Connect Cloud, plus the MODFLOW 6 / MODPATH 7 (FloPy) additions.
+# Versions are floors; pin exactly before a production deploy after the smoke test.
+
+# --- App framework + interactive map ---
+shiny>=1.2
+shinywidgets>=0.3.4
+ipyleaflet>=0.19
+
+# --- DEM fetch + NHD hydrography (USGS 3DEP / NHDPlus / NLDI via HyRiver) ---
+py3dep>=0.19
+pynhd>=0.19
+
+# --- Geospatial core (binary wheels bundle GDAL/GEOS/PROJ) ---
+geopandas>=1.0
+shapely>=2.0
+pyproj>=3.6
+rasterio>=1.3
+rioxarray>=0.15
+xarray>=2024.1
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+
+# --- MODFLOW 6 / MODPATH 7 orchestration + I/O ---
+flopy>=3.7
+netCDF4>=1.6
+scikit-image>=0.22
+tabulate>=0.9
+PyYAML>=6.0
+pydantic>=2
+
+# --- Figures (optional; the core can emit distribution plots) ---
+matplotlib>=3.8
+
+# --- The hyporheic engine (headless core) ---
+# VENDORED: the `hypetool` package is included in this repo (./hypetool), so no extra
+# install is needed — the dependencies above already cover it. (To switch to a git
+# install instead, delete ./hypetool and add:
+#   hypetool @ git+https://github.com/USACE-WRISES/hype-tool@<commit-or-tag> )

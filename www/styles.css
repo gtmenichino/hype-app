@@ -1,0 +1,109 @@
+:root {
+  --hype-accent: #2f4b7c;          /* primary blue (EASI) */
+  --hype-accent-dark: #243a61;     /* dark navy — header / hover */
+  --hype-card-border: #d5deea;
+  --hype-rule: #e5e8ee;
+  --hype-surface-soft: #f6f8fb;
+  --hype-text: #33415c;
+  --hype-label: #2a3344;
+  --hype-muted: #8a93a3;
+  --hype-nav: #cdd8ec;
+  --hype-good: #327a50;
+  --hype-header-h: 50px;
+  --font-head: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { font-family: var(--font-body); color: var(--hype-text); }
+h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
+
+.hype-shell { position: absolute; inset: 0; overflow: hidden; }
+
+/* map fills everything BELOW the header so leaflet's controls never land on the header */
+.hype-map-wrap { position: absolute; top: var(--hype-header-h); left: 0; right: 0; bottom: 0; z-index: 0; }
+.hype-map-wrap > div,
+.hype-map-wrap .shiny-html-output,
+.hype-map-wrap .jupyter-widgets { height: 100% !important; width: 100% !important; }
+.hype-map-wrap .leaflet-container { height: 100% !important; width: 100% !important; }
+
+/* ---- header ---- */
+.hype-header { position: absolute; top: 0; left: 0; right: 0; height: var(--hype-header-h); z-index: 1200;
+  display: flex; align-items: center; justify-content: space-between; padding: 0 16px;
+  background: var(--hype-accent-dark); color: #fff; }
+.hype-brand { font-family: var(--font-head); font-weight: 700; font-size: 1.08rem; letter-spacing: .3px; }
+.hype-brand small { font-weight: 400; opacity: .82; font-size: .8rem; margin-left: 10px; }
+.hype-nav { display: flex; gap: 18px; }
+.hype-nav a { color: var(--hype-nav); text-decoration: none; font-size: 13px; cursor: pointer; }
+.hype-nav a:hover { color: #fff; }
+
+/* ---- left workflow pane ---- */
+.hype-leftpane { position: absolute; top: calc(var(--hype-header-h) + 12px); left: 12px; width: 336px;
+  max-height: calc(100vh - var(--hype-header-h) - 24px); overflow-y: auto; z-index: 1100;
+  background: #fff; border: 1px solid var(--hype-card-border); border-radius: 8px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, .18); }
+.hype-pane-head { background: var(--hype-accent); color: #fff; padding: 9px 14px;
+  font-family: var(--font-head); font-weight: 600; border-radius: 8px 8px 0 0; }
+.hype-pane-body { padding: 12px 14px 16px; }
+
+/* ---- stepper ---- */
+.hype-steps { display: flex; gap: 4px; margin-bottom: 14px; }
+.hype-step { flex: 1; text-align: center; font-size: 10px; color: var(--hype-muted); padding: 5px 2px 6px;
+  border-top: 3px solid #e2e7ef; text-decoration: none; cursor: pointer; border-radius: 0 0 3px 3px; }
+.hype-step:hover { background: var(--hype-surface-soft); color: var(--hype-accent); text-decoration: none; }
+.hype-step.active { color: var(--hype-accent); font-weight: 700; border-top-color: var(--hype-accent); }
+.hype-step.disabled { color: #c2c8d2; pointer-events: none; border-top-color: #eef1f5; }
+
+/* ---- pane content ---- */
+.hype-instr { background: var(--hype-surface-soft); border-left: 3px solid var(--hype-accent);
+  padding: 8px 10px; font-size: 12.5px; color: var(--hype-text); margin-bottom: 10px;
+  border-radius: 0 4px 4px 0; line-height: 1.4; }
+.hype-actions { display: flex; gap: 8px; margin-top: 14px; }
+.hype-chk { font-size: 13px; color: var(--hype-muted); padding: 2px 0; }
+.hype-chk.ok { color: var(--hype-good); font-weight: 600; }
+.hype-warn { font-size: 12px; color: #9a6700; background: #fff8e1; border: 1px solid #ffe0a3;
+  border-radius: 6px; padding: 6px 8px; margin-top: 10px; }
+
+.hype-estimate { font-size: 12.5px; padding: 8px 10px; border-radius: 6px; margin-top: 12px; line-height: 1.35; }
+.hype-estimate.green { background: #e7f7ec; color: #1a7f37; border: 1px solid #b7e3c3; }
+.hype-estimate.amber { background: #fff6e5; color: #9a6700; border: 1px solid #ffd591; }
+.hype-estimate.red   { background: #fdecea; color: #b42318; border: 1px solid #f3b4ad; }
+
+/* ---- bottom-left readout ---- */
+.hype-readout { position: absolute; left: 12px; bottom: 12px; z-index: 1100;
+  background: rgba(255, 255, 255, .92); border: 1px solid var(--hype-card-border); border-radius: 5px;
+  padding: 4px 9px; font-size: 11px; color: var(--hype-text); font-variant-numeric: tabular-nums; }
+
+/* ---- busy / spinner ---- */
+.hype-busy { display: flex; align-items: center; gap: 8px; color: var(--hype-accent); font-size: 13px; margin: 10px 0; }
+.hype-spinner { width: 15px; height: 15px; border: 2px solid var(--hype-nav); border-top-color: var(--hype-accent);
+  border-radius: 50%; animation: hype-spin .8s linear infinite; }
+@keyframes hype-spin { to { transform: rotate(360deg); } }
+
+/* ---- live log ---- */
+.hype-log { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11px; white-space: pre-wrap;
+  max-height: 340px; overflow: auto; background: #0d1117; color: #c9d1d9; padding: 10px; border-radius: 6px; margin: 8px 0 0; }
+
+/* ---- buttons + inputs ---- */
+.btn-primary { background: var(--hype-accent); border-color: var(--hype-accent); }
+.btn-primary:hover, .btn-primary:focus { background: var(--hype-accent-dark); border-color: var(--hype-accent-dark); }
+.hype-pane-body .form-label { font-size: 12.5px; margin-bottom: 2px; color: var(--hype-label); font-weight: 500; }
+.hype-pane-body .shiny-input-container { margin-bottom: 9px; }
+.hype-pane-body input.form-control, .hype-pane-body select.form-select { font-size: 13px; padding: 4px 8px; }
+.hype-pane-body .btn { font-size: 13px; }
+
+/* ---- leaflet controls: accent + subtle inset from the header ---- */
+.hype-map-wrap .leaflet-control-zoom a, .hype-map-wrap .leaflet-bar a { color: var(--hype-accent); }
+.hype-map-wrap .leaflet-top { top: 6px; }
+.hype-map-wrap .leaflet-right { right: 6px; }
+
+/* ---- run status card + progress bar ---- */
+.hype-run-status { margin: 4px 0 2px; }
+.hype-run-head { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--hype-text); }
+.hype-run-label { flex: 1; font-weight: 600; }
+.hype-elapsed { font-variant-numeric: tabular-nums; color: var(--hype-muted); font-size: 12px; }
+.hype-prog { height: 7px; background: #e6ebf3; border-radius: 5px; overflow: hidden; margin-top: 8px; }
+.hype-prog-bar { height: 100%; background: var(--hype-accent); border-radius: 5px; transition: width .4s ease; }
+.hype-prog-bar.indet { width: 35%; animation: hype-indet 1.2s ease-in-out infinite; }
+@keyframes hype-indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }

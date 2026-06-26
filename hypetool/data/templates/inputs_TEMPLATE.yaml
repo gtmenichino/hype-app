@@ -1,0 +1,82 @@
+﻿# ---------------------------------------------------------------------
+# Paths to spatial rasters & shapefiles
+# ---------------------------------------------------------------------
+water_surface_elevation_raster: ./WSE (Max).USGS_1m_FebApril2018_DEM.U_USGS-3DEP_dtm_hyrdo_flattened_20240412.2041_1.tif   # WSE filepath [tif]
+terrain_elevation_raster: ./BlendedTerrain.LoweredTerrain.tif  # Terrain filepath [tif]
+ground_water_domain_shapefile: ./GWDomain.shp  # GW Domain filepath [shp]
+left_boundary_floodplain: ./L_FPL.shp  # Left GW Bdry filepath [shp]
+right_boundary_floodplain: ./R_FPL.shp  # Right GW Bdry filepath [shp]
+projection_file: ./102739_TX_central.prj  # Projection filepath [prj]
+output_directory: ../output  # Output directory for model results [dir]
+aerial_raster: ./HighResOrtho_23Oct2014_Clip.tif  # Aerial imagery for plotting [tif]
+
+# Optional: spatially varying hydraulic conductivity zones (polygon)
+# If enabled, the shapefile's attributes will be mapped to the grid and
+# used to build per-cell KH (and KV if present). Cells with no coverage
+# fall back to the scalar defaults (kh/kv). Expected fields:
+#   ZONE_ID, KH, KV, TOP_ELEV, BOT_ELEV, LABEL
+kh_polygon: false
+kh_polygon_shapefile:
+
+# ---------------------------------------------------------------------
+# Executables (optional overrides)
+# Leave these blank to use the executables that ship with hypetool
+# (they will be added to PATH automatically). You may either:
+#   - set 'modflow_bin_dir' to a folder containing mf6/mp7, or
+#   - set explicit 'md6_exe_path' / 'md7_exe_path' file paths.
+# ---------------------------------------------------------------------
+modflow_bin_dir:
+md6_exe_path:
+md7_exe_path:
+
+# ---------------------------------------------------------------------
+# Simulation metadata
+# ---------------------------------------------------------------------
+sim_name: Hyporheic
+length_units: feet  # feet | meters
+time_units: days  # days  | seconds
+
+# ---------------------------------------------------------------------
+# Grid / domain settings
+# ---------------------------------------------------------------------
+cell_size_x: 10.0  # units follow length_units
+cell_size_y: 10.0
+gw_mod_depth: 20.0
+z: 0.5  # layer thickness
+
+# ---------------------------------------------------------------------
+# Hydraulic parameters
+# ---------------------------------------------------------------------
+kh: 10.0  # horizontal K
+kv: 1.0  # vertical K
+gw_offset: 0.1 # Feet offset between WSE and GW table
+porosity: 0.3  
+
+# ---------------------------------------------------------------------
+# Stress-period / timestep
+# ---------------------------------------------------------------------
+nstp: 1
+perlen: 1.0
+tsmult: 1.0
+
+# ---------------------------------------------------------------------
+# Run Settings
+# ---------------------------------------------------------------------
+write: true
+run: true
+plot: true
+plot_show: true
+plot_save: true
+
+# ---------------------------------------------------------------------
+# Contours & Map
+# ---------------------------------------------------------------------
+# When true, the driver will build head contours from exported GeoTIFFs
+# and add them to the active map in ArcGIS Pro (requires Spatial Analyst).
+build_contours_in_driver: false
+# Contour interval in length units (feet/meters)
+contour_interval: 0.5
+# Limit the number of GeoTIFF layers to contour. Leave empty for all.
+# Set to 0 or a negative number to skip contour generation.
+max_layers:
+

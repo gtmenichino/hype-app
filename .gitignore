@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+# local HyRiver / aiohttp request cache (dev only; Connect Cloud caches to /tmp)
+cache/
+*.sqlite
+# per-session model scratch (never commit run output)
+/tmp/
+results/
+output/
+*.hds
+*.cbb
+*.mppth
