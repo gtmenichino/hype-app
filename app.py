@@ -24,6 +24,15 @@ from pathlib import Path
 os.environ.setdefault("HYRIVER_CACHE_NAME", os.path.join(tempfile.gettempdir(), "hype_hyriver.sqlite"))
 os.environ.setdefault("HYRIVER_CACHE_EXPIRE", str(7 * 24 * 3600))
 
+# Quiet two harmless, environment-emitted startup messages on the headless server (set before
+# matplotlib / shinywidgets load below): matplotlib scanning the non-scalable Noto color-emoji
+# font while building its cache, and shinywidgets' own internal use of the deprecated
+# ipywidgets `Widget.widgets` API.
+import logging  # noqa: E402
+import warnings  # noqa: E402
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=r".*Widget\.widgets is deprecated.*")
+
 import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
