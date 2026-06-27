@@ -1,25 +1,27 @@
-/* HYPE Reach-tab draw guidance.
+/* HYPE map draw guidance (Reach + Boundaries steps).
  *
  * The server (app.py `_push_reach_state`) sends a "hype_reach" custom message describing how the
- * Reach-tab map should behave, and this module realizes it on the client:
+ * map should behave, and this module realizes it on the client:
  *
  *   • picking  → show a crosshair-follow tooltip ("Click to select a point on a stream") while the
- *                user picks the 2 auto-delineation points (the actual snap happens server-side).
- *   • arm      → auto-start Leaflet.draw's polyline tool so manual mode shows the real
- *                "Click to start drawing line" crosshair/tooltip with no toolbar button to hunt for.
- *   • canEdit  → double-click the drawn centerline to toggle vertex editing (and save).
+ *                user picks the 2 auto-delineation points (Reach auto; the snap happens server-side).
+ *   • arm      → auto-start Leaflet.draw's polyline/polygon tool (`armShape`) so the active shape
+ *                shows the real "Click to start drawing…" crosshair/tooltip with no button to hunt.
+ *   • canEdit  → double-click the loaded shape to toggle vertex editing (and save).
+ *   • slot     → which thing is being edited (reach / up / left / right / down / wse); a change
+ *                commits/cancels any in-progress draw or edit so switching boundaries stays clean.
  *
- * The Reach-tab toolbar itself is hidden by CSS (app.py `reach_map_style`); the control stays in
- * the DOM, so we drive it by clicking its (hidden) anchors — the supported Leaflet.draw path. The
- * draw/edit "actions" bar's inline display:block is our source of truth for whether a draw/edit is
- * currently active, since Leaflet.draw sets it even while the toolbar is hidden.
+ * The toolbar is hidden by CSS (app.py `map_edit_style`); the control stays in the DOM, so we drive
+ * it by clicking its (hidden) anchors — the supported Leaflet.draw path. The draw/edit "actions"
+ * bar's inline display:block is our source of truth for whether a draw/edit is currently active,
+ * since Leaflet.draw sets it even while the toolbar is hidden.
  */
 (function () {
   "use strict";
 
   var WRAP = ".hype-map-wrap";
   var PICK_TEXT = "Click to select a point on a stream.";
-  var state = { picking: false, arm: false, canEdit: false, step: null };
+  var state = { picking: false, arm: false, canEdit: false, step: null, slot: null, armShape: "line" };
   var tip = null;
 
   // ---- DOM helpers (all scoped to the map wrapper) ----
@@ -49,9 +51,13 @@
 
   function click(el) { if (el) { try { el.click(); } catch (e) { /* ignore */ } } }
 
-  // ---- manual-draw arming (retries while the widget view is still mounting) ----
+  // ---- draw arming (line or polygon per armShape; retries while the view is still mounting) ----
+  function drawAnchor() {
+    return state.armShape === "polygon" ? q(".leaflet-draw-draw-polygon")
+                                        : q(".leaflet-draw-draw-polyline");
+  }
   function arm(tries) {
-    var b = q(".leaflet-draw-draw-polyline");
+    var b = drawAnchor();
     if (b) { if (!isDrawing()) click(b); return; }
     if ((tries || 0) < 20) setTimeout(function () { arm((tries || 0) + 1); }, 100);
   }
@@ -98,6 +104,13 @@
   }
 
   function onMessage(s) {
+    var nextSlot = s.slot || null;
+    if (nextSlot !== state.slot) {        // switching target → commit/cancel any in-progress work
+      if (isEditing()) click(saveLink());
+      if (isDrawing()) cancelDraw();
+    }
+    state.slot = nextSlot;
+    state.armShape = s.armShape || "line";
     state.picking = !!s.picking;
     state.arm = !!s.arm;
     state.canEdit = !!s.canEdit;

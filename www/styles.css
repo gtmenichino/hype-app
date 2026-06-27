@@ -62,6 +62,17 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-actions { display: flex; gap: 8px; margin-top: 14px; }
 .hype-chk { font-size: 13px; color: var(--hype-muted); padding: 2px 0; }
 .hype-chk.ok { color: var(--hype-good); font-weight: 600; }
+
+/* ---- per-boundary draw/edit buttons (color-coded to match the map layers) ---- */
+.hype-bnd-label { font-size: 12px; font-weight: 600; color: var(--hype-label); margin: 12px 0 4px; }
+.hype-bnd-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.hype-bnd-btn { flex: 1 1 46%; background: #fff; border: 1px solid var(--hype-card-border);
+  border-left-width: 4px; color: var(--hype-text); font-size: 12px; padding: 4px 8px; }
+.hype-bnd-btn:hover { background: var(--hype-surface-soft); }
+.hype-bnd-up    { border-left-color: #f08c00; }
+.hype-bnd-left  { border-left-color: #1f6feb; }
+.hype-bnd-right { border-left-color: #d83933; }
+.hype-bnd-down  { border-left-color: #9b59b6; }
 .hype-warn { font-size: 12px; color: #9a6700; background: #fff8e1; border: 1px solid #ffe0a3;
   border-radius: 6px; padding: 6px 8px; margin-top: 10px; }
 

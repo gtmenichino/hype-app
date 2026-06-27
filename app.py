@@ -61,8 +61,10 @@ CONTOUR_STYLE = {"color": "#11161c", "weight": 1, "opacity": 0.85, "fillOpacity"
 # drawn inputs — thin outlines / minimal fill so they never hide the head raster underneath
 DOMAIN_STYLE = {"color": "#caa700", "weight": 2, "opacity": 0.95, "fill": False}
 WSE_STYLE = {"color": "#1aa6a6", "weight": 2, "opacity": 0.95, "fillColor": "#1aa6a6", "fillOpacity": 0.12}
-LEFT_STYLE = {"color": "#1f6feb", "weight": 3, "opacity": 0.95}
-RIGHT_STYLE = {"color": "#d83933", "weight": 3, "opacity": 0.95}
+LEFT_STYLE = {"color": "#1f6feb", "weight": 3, "opacity": 0.95}      # Left FPL (blue)
+RIGHT_STYLE = {"color": "#d83933", "weight": 3, "opacity": 0.95}     # Right FPL (red)
+UP_STYLE = {"color": "#f08c00", "weight": 3, "opacity": 0.95}        # Upstream boundary (orange)
+DOWN_STYLE = {"color": "#9b59b6", "weight": 3, "opacity": 0.95}      # Downstream boundary (purple)
 KZONE_STYLE = {"color": "#7b3fa0", "weight": 2, "opacity": 0.95, "fill": False}
 NHD_STYLE = {"color": "#00c2ff", "weight": 3.5, "opacity": 0.95}     # clickable NHD flowlines (bold)
 REACH_STYLE = {"color": "#ff2d95", "weight": 5, "opacity": 0.95}     # the analysis reach (magenta — pops on USGS topo, distinct from cyan NHD)
@@ -111,7 +113,7 @@ app_ui = ui.page_fillable(
         ui.div(ui.output_ui("leftpane"), class_="hype-leftpane"),
         ui.output_ui("readout"),
         ui.output_ui("flow_loading"),
-        ui.output_ui("reach_map_style"),
+        ui.output_ui("map_edit_style"),
         class_="hype-shell",
     ),
     title="HYPE — Hyporheic Exchange Explorer",
@@ -133,9 +135,13 @@ def server(input, output, session):
     work_dir = Path(tempfile.mkdtemp(prefix="hype_session_"))
 
     current_step = reactive.value(STEP_REACH)
-    domain_feat = reactive.value(None)
-    left_feat = reactive.value(None)
-    right_feat = reactive.value(None)
+    # Four named boundary lines (4326) that close into the domain (the domain is DERIVED from them
+    # via geometry.assemble_domain_from_sides — see the domain_feat calc below).
+    up_feat = reactive.value(None)         # Upstream boundary LineString Feature
+    left_feat = reactive.value(None)       # Left FPL boundary LineString Feature
+    right_feat = reactive.value(None)      # Right FPL boundary LineString Feature
+    down_feat = reactive.value(None)       # Downstream boundary LineString Feature
+    bnd_slot = reactive.value(None)        # boundary being drawn/edited: up|left|right|down|wse|None
     kzone_feats = reactive.value([])       # list of GeoJSON polygon features (4326)
     wse_extent_feat = reactive.value(None)  # drawn water-surface (wetted) extent polygon (4326)
     wse_mode_v = reactive.value("draw")     # mirror of the WSE-mode radio; persists across steps
@@ -233,6 +239,18 @@ def server(input, output, session):
         else:
             _set_layer("head_contours", None)
 
+    @reactive.calc
+    def _domain_build():
+        """Assemble the domain (+ normalized left/right upstream→downstream) from the four boundary
+        lines, or None until all four exist / if they can't close into a valid ring."""
+        return geometry.assemble_domain_from_sides(up_feat(), left_feat(), right_feat(), down_feat())
+
+    @reactive.calc
+    def domain_feat():
+        """The domain polygon Feature, DERIVED from the four boundary lines (None until buildable)."""
+        b = _domain_build()
+        return b["domain"] if b else None
+
     def _domain_gdf_4326():
         f = domain_feat()
         return geometry.single_feature_gdf(f) if f else None
@@ -264,16 +282,27 @@ def server(input, output, session):
             "type": "FeatureCollection", "features": [feat]}
 
     _MIRROR_NAMES = ("Domain", "Water-surface extent", "Left boundary", "Right boundary",
-                     "K-zones", "Reach")
+                     "Upstream boundary", "Downstream boundary", "K-zones", "Reach")
+    # Boundary slot → (map-layer name, style). The active slot lives in the DrawControl; the rest
+    # render as static colored layers so all four sides stay visible while you edit one.
+    _BND_STATIC = {"up": ("Upstream boundary", UP_STYLE), "left": ("Left boundary", LEFT_STYLE),
+                   "right": ("Right boundary", RIGHT_STYLE), "down": ("Downstream boundary", DOWN_STYLE)}
+
+    def _slot_value(slot):
+        return {"up": up_feat, "left": left_feat, "right": right_feat, "down": down_feat,
+                "wse": wse_extent_feat}.get(slot)
 
     def _mirror_features_as_layers():
         """Show the geometry as named, toggleable, thin static layers (features read isolated)."""
         with reactive.isolate():
-            dom, wse, lf, rf, kz, rch = (domain_feat(), wse_extent_feat(), left_feat(),
-                                         right_feat(), list(kzone_feats()), reach_feat())
-        for nm, feat, style in zip(("Domain", "Water-surface extent", "Left boundary",
-                                    "Right boundary"), (dom, wse, lf, rf),
-                                   (DOMAIN_STYLE, WSE_STYLE, LEFT_STYLE, RIGHT_STYLE)):
+            dom, wse, lf, rf, uf, df, kz, rch = (
+                domain_feat(), wse_extent_feat(), left_feat(), right_feat(),
+                up_feat(), down_feat(), list(kzone_feats()), reach_feat())
+        for nm, feat, style in (("Domain", dom, DOMAIN_STYLE),
+                                ("Water-surface extent", wse, WSE_STYLE),
+                                ("Left boundary", lf, LEFT_STYLE), ("Right boundary", rf, RIGHT_STYLE),
+                                ("Upstream boundary", uf, UP_STYLE),
+                                ("Downstream boundary", df, DOWN_STYLE)):
             _set_layer(nm, GeoJSON(data=_fc(feat), style=style, name=nm) if feat else None)
         _set_layer("K-zones", GeoJSON(data={"type": "FeatureCollection", "features": kz},
                                       style=KZONE_STYLE, name="K-zones") if kz else None)
@@ -283,31 +312,43 @@ def server(input, output, session):
         for nm in _MIRROR_NAMES:
             _set_layer(nm, None)
 
+    def _render_boundaries(active):
+        """Boundaries-step display: each side except the `active` one (which is in the DrawControl)
+        as a static colored layer, plus the derived domain, the WSE (unless active), and the reach."""
+        with reactive.isolate():
+            feats = {"up": up_feat(), "left": left_feat(), "right": right_feat(), "down": down_feat()}
+            wse = wse_extent_feat(); dom = domain_feat(); rch = reach_feat()
+        for slot, (nm, style) in _BND_STATIC.items():
+            f = feats[slot] if slot != active else None
+            _set_layer(nm, GeoJSON(data=_fc(f), style=style, name=nm) if f else None)
+        _set_layer("Domain", GeoJSON(data=_fc(dom), style=DOMAIN_STYLE, name="Domain") if dom else None)
+        wse_show = wse if active != "wse" else None
+        _set_layer("Water-surface extent", GeoJSON(data=_fc(wse_show), style=WSE_STYLE,
+                   name="Water-surface extent") if wse_show else None)
+        _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
+        _set_layer("K-zones", None)
+
     @reactive.effect
     def _sync_map_shapes():
-        # Fires on STEP change only (features read isolated) so a user vertex-edit doesn't clobber
-        # the in-progress drawing. On an edit step (Reach/Boundaries/K) load that step's shapes into
-        # the DrawControl; on other steps clear the DrawControl + mirror features as static layers.
+        # Fires on STEP change (features isolated). Reach/K load their shapes into the DrawControl;
+        # Boundaries is driven per-active-slot by _sync_bnd_slot; other steps clear + mirror statics.
         if not _HAS_MAP:
             return
         step = current_step()
         dc = _draw_ctl.get("dc")
         with reactive.isolate():
-            dom, wse, lf, rf = domain_feat(), wse_extent_feat(), left_feat(), right_feat()
             kz = list(kzone_feats()); rch = reach_feat(); mode = delineate_mode()
-        if step in EDIT_STEPS:
+        if step == STEP_REACH:
             _clear_mirror_layers()
-            if step == STEP_REACH:
-                ed = [rch] if (mode == "manual" and rch) else []
-                _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach")
-                           if (mode == "auto" and rch) else None)
-            elif step == STEP_BOUNDARIES:
-                ed = [f for f in (dom, wse, lf, rf) if f]
-                _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
-            else:                                            # STEP_K
-                ed = kz
-                _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
-            _load_into_drawcontrol(ed)
+            _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach")
+                       if (mode == "auto" and rch) else None)
+            _load_into_drawcontrol([rch] if (mode == "manual" and rch) else [])
+        elif step == STEP_K:
+            _clear_mirror_layers()
+            _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
+            _load_into_drawcontrol(kz)
+        elif step == STEP_BOUNDARIES:
+            pass                                   # _sync_bnd_slot owns the Boundaries display
         else:
             if dc is not None:
                 try:
@@ -316,36 +357,59 @@ def server(input, output, session):
                     pass
             _mirror_features_as_layers()
 
+    @reactive.effect
+    def _sync_bnd_slot():
+        # Owns the Boundaries-step map: load ONLY the active boundary into the DrawControl (so
+        # Leaflet.draw never has to disambiguate four similar lines) and mirror the rest as statics.
+        if not _HAS_MAP:
+            return
+        step = current_step()
+        slot = bnd_slot()
+        if step != STEP_BOUNDARIES:
+            if slot is not None:
+                with reactive.isolate():
+                    bnd_slot.set(None)             # reset when leaving so re-entry starts clean
+            return
+        _clear_mirror_layers()
+        with reactive.isolate():
+            sv = _slot_value(slot)
+            active_feat = sv() if sv is not None else None
+        _load_into_drawcontrol([active_feat] if active_feat else [])
+        _render_boundaries(slot)
+
+    @reactive.effect
+    def _refresh_domain_outline():
+        # Keep the derived-domain outline live as sides are edited (the calc tracks the four slots).
+        if not _HAS_MAP or current_step() != STEP_BOUNDARIES:
+            return
+        dom = domain_feat()
+        _set_layer("Domain", GeoJSON(data=_fc(dom), style=DOMAIN_STYLE, name="Domain") if dom else None)
+
     def _reclassify_drawn():
-        """Re-derive the feature values from the DrawControl's current shapes, routed by step:
-        Reach (manual) → the drawn line is the reach centerline; K → polygons are K-zones;
-        Boundaries → largest polygon = domain, next = wetted extent, the two lines = left/right (W→E)."""
-        from shapely.geometry import shape as _shape
+        """Re-derive feature values from the DrawControl's shapes, routed by step: Reach (manual) →
+        the drawn line is the reach centerline; K → polygons are K-zones; Boundaries → the single
+        shape goes to the active boundary slot (up/left/right/down = line, wse = polygon)."""
         dc = _draw_ctl.get("dc")
         feats = list(getattr(dc, "data", None) or [])
-        polys = [f for f in feats if (f.get("geometry") or {}).get("type") == "Polygon"]
-        lines = [f for f in feats if (f.get("geometry") or {}).get("type") == "LineString"]
         step = current_step()
         if step == STEP_REACH:
+            lines = [f for f in feats if (f.get("geometry") or {}).get("type") == "LineString"]
             if delineate_mode() == "manual" and lines:
                 reach_feat.set(lines[0])
             return
         if step == STEP_K:
-            kzone_feats.set(polys)
+            kzone_feats.set([f for f in feats if (f.get("geometry") or {}).get("type") == "Polygon"])
             return
         if step != STEP_BOUNDARIES:
             return
-        polys.sort(key=lambda f: _shape(f["geometry"]).area, reverse=True)
-        domain_feat.set(polys[0] if polys else None)
-        if wse_mode_v() != "upload":
-            wse_extent_feat.set(polys[1] if len(polys) > 1 else None)
-
-        def _meanx(f):
-            cs = f["geometry"]["coordinates"]
-            return sum(c[0] for c in cs) / max(len(cs), 1)
-        lines.sort(key=_meanx)
-        left_feat.set(lines[0] if lines else None)
-        right_feat.set(lines[1] if len(lines) > 1 else None)
+        slot = bnd_slot()
+        if not slot:
+            return
+        want = "Polygon" if slot == "wse" else "LineString"
+        match = next((f for f in feats if (f.get("geometry") or {}).get("type") == want), None)
+        sv = _slot_value(slot)
+        if match is not None and sv is not None:
+            sv.set(match)
 
     def _load_into_drawcontrol(feats):
         """Put generated GeoJSON Features into the DrawControl so the user can edit them."""
@@ -675,20 +739,21 @@ def server(input, output, session):
             d = delineate_task.result()
         except Exception:  # noqa: BLE001
             return
-        domain_feat.set(d["domain"]); left_feat.set(d["left"]); right_feat.set(d["right"])
+        # Fill the four named boundary slots (domain derives from them); up/down are now first-class
+        # editable boundaries, not static caps.
+        up_feat.set(d.get("up_cap")); left_feat.set(d["left"])
+        right_feat.set(d["right"]); down_feat.set(d.get("down_cap"))
         wse_extent_feat.set(d["wse_extent"]); wse_mode_v.set("draw")
-        for nm, key in (("Upstream cap", "up_cap"), ("Downstream cap", "down_cap")):
-            f = d.get(key)
-            _set_layer(nm, GeoJSON(data={"type": "FeatureCollection", "features": [f]},
-                                   style=CAP_STYLE, name=nm) if f else None)
         with reactive.isolate():
             on_boundaries = current_step() == STEP_BOUNDARIES
-        if on_boundaries:                      # refresh while editing → reload the editable shapes
-            _load_into_drawcontrol([d["domain"], d["wse_extent"], d["left"], d["right"]])
+            bnd_slot.set(None)                 # deselect; nothing armed until a boundary button is clicked
+        if on_boundaries:
+            _load_into_drawcontrol([])
+            _render_boundaries(None)
         else:                                  # generated before reaching Boundaries → show statics
             _mirror_features_as_layers()
         ui.notification_show("Domain, boundaries & wetted extent generated — open the Boundaries tab "
-                             "to review/edit (drag vertices).", duration=8)
+                             "to review/edit each boundary.", duration=8)
 
     @reactive.effect
     @reactive.event(input.regen)
@@ -801,9 +866,10 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.run_model)
     def _start_run():
-        if not (domain_feat() and left_feat() and right_feat() and dem_path()):
-            ui.notification_show("Need a domain, both boundary lines, and terrain first.",
-                                 type="warning", duration=5)
+        build = _domain_build()                 # assembled domain + left/right oriented upstream→downstream
+        if not (build and dem_path()):
+            ui.notification_show("Need all four boundaries (Upstream/Left/Right/Downstream) that close "
+                                 "into a domain, plus terrain.", type="warning", duration=6)
             return
         est = grid_estimate()
         if est and estimate.band(est["n_cells"]) == "red":
@@ -819,8 +885,8 @@ def server(input, output, session):
             crs_id = crs.to_epsg() or crs.to_wkt()      # picklable for the child process
             use_kz = bool(_safe("use_kzones", False))
             payload = {
-                "crs": crs_id, "domain": domain_feat(), "left": left_feat(),
-                "right": right_feat(), "dem": dem_path(), "params": params(),
+                "crs": crs_id, "domain": build["domain"], "left": build["left"],
+                "right": build["right"], "dem": dem_path(), "params": params(),
                 "work_dir": str(work_dir),
                 "wse_mode": "dem",          # fallback only; wse_path (below) always wins
                 "wse_path": wse,
@@ -960,7 +1026,7 @@ def server(input, output, session):
             r.add(STEP_DEM)
         if dem_path() is not None:
             r.add(STEP_BOUNDARIES)
-        if domain_feat() and left_feat() and right_feat():
+        if _domain_build() is not None:          # all four boundaries close into a valid domain
             r.update({STEP_K, STEP_MESH})
         if run_result() is not None:
             r.update({STEP_RUN, STEP_RESULTS})
@@ -999,6 +1065,26 @@ def server(input, output, session):
                     else:
                         ui.notification_show("Finish this step first.", type="warning", duration=4)
 
+    @reactive.effect
+    def _bnd_select():
+        # Per-boundary buttons pick which boundary is editable (only that one loads into the
+        # DrawControl — see _sync_bnd_slot). Same strict-increment guard as _continue_nav so a
+        # leftpane re-render's count reset can't spuriously select; clicking the active one again
+        # deselects (finishes editing).
+        for bid, slot in (("bnd_up", "up"), ("bnd_left", "left"), ("bnd_right", "right"),
+                          ("bnd_down", "down"), ("bnd_wse", "wse")):
+            try:
+                n = int(input[bid]() or 0)
+            except Exception:  # noqa: BLE001
+                n = 0
+            last = _nav_seen.get(bid, 0)
+            if n != last:
+                _nav_seen[bid] = n
+                if n > last:
+                    with reactive.isolate():
+                        cur = bnd_slot()
+                    bnd_slot.set(None if cur == slot else slot)
+
     def _clear_auto_picks():
         pick_pts.set([]); reach_feat.set(None); auto_meta.set(None); last_click.set(None)
         for nm in ("pick1", "pick2", "Reach", "Upstream cap", "Downstream cap"):
@@ -1015,7 +1101,8 @@ def server(input, output, session):
     @reactive.event(input.clear_points)
     def _clear_points():
         _clear_auto_picks()
-        domain_feat.set(None); left_feat.set(None); right_feat.set(None); wse_extent_feat.set(None)
+        up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
+        wse_extent_feat.set(None); bnd_slot.set(None)
         dem_path.set(None); dem_meta.set(None)   # also drop the downloaded DEM + its overlay
         _set_layer("dem", None)
         ui.notification_show("Cleared points, linework, and DEM — pick a new upstream and "
@@ -1024,8 +1111,9 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.clear_draw)
     def _clear_draw():
-        domain_feat.set(None); left_feat.set(None); right_feat.set(None)
-        kzone_feats.set([]); wse_extent_feat.set(None); dem_path.set(None); dem_meta.set(None)
+        up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
+        kzone_feats.set([]); wse_extent_feat.set(None); bnd_slot.set(None)
+        dem_path.set(None); dem_meta.set(None)
         _set_layer("dem", None)
         _clear_auto_picks()
         ui.notification_show("Cleared.", duration=3)
@@ -1033,8 +1121,9 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.nav_new)
     def _reset():
-        domain_feat.set(None); left_feat.set(None); right_feat.set(None)
-        kzone_feats.set([]); wse_extent_feat.set(None); dem_path.set(None); dem_meta.set(None)
+        up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
+        kzone_feats.set([]); wse_extent_feat.set(None); bnd_slot.set(None)
+        dem_path.set(None); dem_meta.set(None)
         run_result.set(None); stage.set("")
         head_tifs.set([]); head_rng.set(None); _head_cache.clear(); _contour_cache.clear()
         pick_pts.set([]); reach_feat.set(None); auto_meta.set(None); last_click.set(None)
@@ -1058,9 +1147,10 @@ def server(input, output, session):
                 "point on a blue NHD stream to trace the reach (≤ 1 mile). Or **Manual**: draw the "
                 "reach centerline (double-click the line to edit it) and enter the drainage area.\n"
                 "2. **DEM** — pick a 3DEP resolution and **Fetch terrain** over the reach.\n"
-                "3. **Boundaries** — the domain, left/right boundaries & wetted extent are generated "
-                "from cross-sections (floodplain = X × bankfull depth). Drag vertices to edit or "
-                "**Refresh** to regenerate; set the boundary-condition gradients here.\n"
+                "3. **Boundaries** — **Generate boundaries** builds the four sides (Upstream, Left "
+                "FPL, Right FPL, Downstream — floodplain = X × bankfull depth) + the wetted extent, "
+                "which close into the domain. Click a boundary to draw/edit it (double-click the line "
+                "to edit); set the boundary-condition gradients here.\n"
                 "4. **K** — horizontal/vertical conductivity & porosity; optionally draw K-zone "
                 "polygons.\n"
                 "5. **Mesh** — cell size, model depth & layer thickness (a live estimate keeps the "
@@ -1131,12 +1221,20 @@ def server(input, output, session):
             )
         elif step == STEP_BOUNDARIES:
             body = ui.TagList(
-                ui.div("Generate the domain & boundaries from the reach, then drag vertices to "
-                       "edit (Generate again after changing the multiplier).", class_="hype-instr"),
+                ui.div("Generate the four boundaries from the reach, then click one to draw or edit "
+                       "it (double-click the line to edit). They close into the domain.",
+                       class_="hype-instr"),
                 ui.input_select("fp_mult", "Floodplain extent = X × bankfull depth",
                                 {"2": "2×", "5": "5×", "10": "10× (default)"}, selected="10"),
                 ui.div(ui.input_action_button("regen", "Generate boundaries", class_="btn-primary"),
                        class_="hype-actions"),
+                ui.div("Draw / edit a boundary:", class_="hype-bnd-label"),
+                ui.div(
+                    ui.input_action_button("bnd_up", "Upstream", class_="btn-sm hype-bnd-btn hype-bnd-up"),
+                    ui.input_action_button("bnd_left", "Left FPL", class_="btn-sm hype-bnd-btn hype-bnd-left"),
+                    ui.input_action_button("bnd_right", "Right FPL", class_="btn-sm hype-bnd-btn hype-bnd-right"),
+                    ui.input_action_button("bnd_down", "Downstream", class_="btn-sm hype-bnd-btn hype-bnd-down"),
+                    class_="hype-bnd-row"),
                 ui.output_ui("draw_status"),
                 ui.input_radio_buttons(
                     "wse_mode", "Water surface (top boundary)",
@@ -1146,6 +1244,11 @@ def server(input, output, session):
                     "input.wse_mode === 'upload'",
                     ui.input_file("wse_upload", "WSE GeoTIFF", accept=[".tif", ".tiff"],
                                   multiple=False)),
+                ui.panel_conditional(
+                    "input.wse_mode === 'draw'",
+                    ui.div(ui.input_action_button("bnd_wse", "Draw / edit water surface",
+                                                  class_="btn-sm btn-outline-secondary"),
+                           class_="hype-actions")),
                 ui.input_select("bc_mode", "Boundary condition",
                                 {BC_CORNER: "4 corner gradients", BC_PROFILE: "Spatially varying"},
                                 selected=BC_CORNER),
@@ -1264,18 +1367,27 @@ def server(input, output, session):
 
     @render.ui
     def draw_status():
-        seq = [("Domain polygon", domain_feat() is not None)]
+        active = bnd_slot()
+        seq = [("Upstream boundary", up_feat() is not None),
+               ("Left FPL boundary", left_feat() is not None),
+               ("Right FPL boundary", right_feat() is not None),
+               ("Downstream boundary", down_feat() is not None)]
         if wse_mode_v() != "upload":
             seq.append(("Water-surface extent", wse_extent_feat() is not None))
-        seq += [("Left boundary line", left_feat() is not None),
-                ("Right boundary line", right_feat() is not None)]
         rows = [ui.div(("✓ " if ok else "○ ") + label,
                        class_="hype-chk ok" if ok else "hype-chk") for label, ok in seq]
-        ready = all(ok for _, ok in seq)
-        prompt = ui.div("All set — Continue to K." if ready else
-                        "Click Generate boundaries, or draw them manually (polygon = "
-                        "domain / wetted extent, line = left / right).", class_="hype-instr")
-        return ui.div(prompt, *rows)
+        if active:
+            label = {"up": "Upstream", "left": "Left FPL", "right": "Right FPL",
+                     "down": "Downstream", "wse": "Water surface"}[active]
+            sv = _slot_value(active)
+            has = sv() is not None if sv is not None else False
+            hint = (f"Editing {label} — double-click the line to edit it."
+                    if has else f"Drawing {label} — click on the map to place vertices.")
+        elif _domain_build() is not None:
+            hint = "All four boundaries close into the domain — Continue to K, or click one to refine."
+        else:
+            hint = "Click Generate boundaries, or pick a boundary above to draw it."
+        return ui.div(ui.div(hint, class_="hype-instr"), *rows)
 
     @render.ui
     def kzone_status():
@@ -1384,20 +1496,26 @@ def server(input, output, session):
                       class_="hype-flow-loading")
 
     @render.ui
-    def reach_map_style():
-        # On the Reach step the draw tool is auto-driven (see www/reach_draw.js), so hide its
-        # toolbar (the control stays in the DOM — we click its anchors; Leaflet.draw's mouse
-        # tooltip lives in the popup pane, so it still shows). Add a crosshair only while a pick
-        # or draw is actually possible. Mirrors EASI's cursor_style pattern.
-        if not _HAS_MAP or current_step() != STEP_REACH:
+    def map_edit_style():
+        # On the Reach + Boundaries steps the draw tool is auto-driven (www/reach_draw.js), so hide
+        # the Leaflet.draw toolbar (the control stays in the DOM — we click its anchors; its mouse
+        # tooltip lives in the popup pane, so it still shows). Add a crosshair only while a pick or a
+        # fresh draw is actually possible. Mirrors EASI's cursor_style pattern.
+        if not _HAS_MAP or current_step() not in (STEP_REACH, STEP_BOUNDARIES):
             return None
         css = ".hype-map-wrap .leaflet-draw{display:none !important;}"
-        z, _c = _view()
-        no_reach = reach_feat() is None
-        armed = delineate_mode() == "manual" and no_reach
-        picking = (delineate_mode() == "auto" and no_reach and z is not None
-                   and int(z) >= 12 and len(pick_pts()) < 2)
-        if armed or picking:
+        if current_step() == STEP_REACH:
+            z, _c = _view()
+            no_reach = reach_feat() is None
+            armed = delineate_mode() == "manual" and no_reach
+            picking = (delineate_mode() == "auto" and no_reach and z is not None
+                       and int(z) >= 12 and len(pick_pts()) < 2)
+            crosshair = armed or picking
+        else:                                       # Boundaries — crosshair while drawing a fresh side
+            slot = bnd_slot()
+            sv = _slot_value(slot) if slot else None
+            crosshair = bool(slot) and (sv is None or sv() is None)
+        if crosshair:
             css += (".hype-map-wrap .leaflet-grab{cursor:crosshair !important;}"
                     ".hype-map-wrap .leaflet-container.leaflet-dragging,"
                     ".hype-map-wrap .leaflet-container.leaflet-dragging .leaflet-grab"
@@ -1406,22 +1524,36 @@ def server(input, output, session):
 
     @reactive.effect
     async def _push_reach_state():
-        # Tell the client (www/reach_draw.js) how to guide the Reach-tab map: show the follow-
-        # cursor pick tooltip, auto-arm the polyline draw tool, and/or allow double-click-to-edit.
+        # Tell the client (www/reach_draw.js) how to guide the map: the follow-cursor pick tooltip
+        # (Reach auto), auto-arm a fresh draw (`armShape` = line/polygon), and/or allow
+        # double-click-to-edit. Covers the Reach centerline and the four Boundaries slots + WSE.
         if not _HAS_MAP:
             return
         step = current_step()
-        mode = delineate_mode()
         z, _c = _view()
-        no_reach = reach_feat() is None
-        on_reach = step == STEP_REACH
-        picking = (on_reach and mode == "auto" and no_reach and z is not None
-                   and int(z) >= 12 and len(pick_pts()) < 2)
+        picking = arm = can_edit = False
+        arm_shape = "line"
+        slot_id = None
+        if step == STEP_REACH:
+            mode = delineate_mode()
+            no_reach = reach_feat() is None
+            picking = (mode == "auto" and no_reach and z is not None and int(z) >= 12
+                       and len(pick_pts()) < 2)
+            arm = mode == "manual" and no_reach
+            can_edit = mode == "manual" and not no_reach
+            slot_id = "reach" if mode == "manual" else None
+        elif step == STEP_BOUNDARIES:
+            slot = bnd_slot()
+            slot_id = slot
+            if slot:
+                sv = _slot_value(slot)
+                has = sv() is not None if sv is not None else False
+                arm_shape = "polygon" if slot == "wse" else "line"
+                arm = not has
+                can_edit = has
         await session.send_custom_message("hype_reach", {
-            "step": step,
-            "picking": bool(picking),
-            "arm": bool(on_reach and mode == "manual" and no_reach),
-            "canEdit": bool(on_reach and mode == "manual" and not no_reach),
+            "step": step, "slot": slot_id, "picking": bool(picking), "arm": bool(arm),
+            "canEdit": bool(can_edit), "armShape": arm_shape,
         })
 
 
