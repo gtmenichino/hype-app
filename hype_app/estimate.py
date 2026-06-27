@@ -30,7 +30,8 @@ def estimate_cells(domain_gdf_proj, cell_size: float, gw_mod_depth: float, z: fl
     nrow = max(1, math.ceil(h / float(cell_size)))
     nlay = max(1, math.ceil(float(gw_mod_depth) / float(z)))
     return {"ncol": ncol, "nrow": nrow, "nlay": nlay, "n_cells": ncol * nrow * nlay,
-            "cell_size": float(cell_size)}
+            "cell_size": float(cell_size),
+            "dom_w": maxx - minx, "dom_h": maxy - miny}   # raw (unbuffered) domain footprint, m
 
 
 def band(n_cells: int) -> str:

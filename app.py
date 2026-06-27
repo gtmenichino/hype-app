@@ -142,6 +142,7 @@ def server(input, output, session):
     right_feat = reactive.value(None)      # Right FPL boundary LineString Feature
     down_feat = reactive.value(None)       # Downstream boundary LineString Feature
     bnd_slot = reactive.value(None)        # boundary being drawn/edited: up|left|right|down|wse|None
+    kz_adding = reactive.value(False)      # True while a guided "Add K-zone" polygon draw is armed
     kzone_feats = reactive.value([])       # list of GeoJSON polygon features (4326)
     wse_extent_feat = reactive.value(None)  # drawn water-surface (wetted) extent polygon (4326)
     wse_mode_v = reactive.value("draw")     # mirror of the WSE-mode radio; persists across steps
@@ -399,6 +400,7 @@ def server(input, output, session):
             return
         if step == STEP_K:
             kzone_feats.set([f for f in feats if (f.get("geometry") or {}).get("type") == "Polygon"])
+            kz_adding.set(False)             # a guided "Add K-zone" draw just completed
             return
         if step != STEP_BOUNDARIES:
             return
@@ -1085,6 +1087,41 @@ def server(input, output, session):
                         cur = bnd_slot()
                     bnd_slot.set(None if cur == slot else slot)
 
+    @reactive.effect
+    def _kz_buttons():
+        # K-zone list management (same strict-increment guard as _continue_nav so leftpane
+        # re-render resets don't fire): Add → arm a guided polygon draw; Remove last / Clear all.
+        def _clicked(bid):
+            try:
+                n = int(input[bid]() or 0)
+            except Exception:  # noqa: BLE001
+                n = 0
+            last = _nav_seen.get(bid, 0)
+            if n != last:
+                _nav_seen[bid] = n
+                return n > last
+            return False
+        if _clicked("kz_add"):
+            kz_adding.set(True)
+        if _clicked("kz_rmlast"):
+            kz = list(kzone_feats())
+            if kz:
+                kz.pop()
+                kzone_feats.set(kz)
+                _load_into_drawcontrol(kz)
+            kz_adding.set(False)
+        if _clicked("kz_clear"):
+            kzone_feats.set([])
+            _load_into_drawcontrol([])
+            kz_adding.set(False)
+
+    @reactive.effect
+    def _reset_kz_adding():
+        if current_step() != STEP_K:           # disarm a pending Add when leaving the K step
+            with reactive.isolate():
+                if kz_adding():
+                    kz_adding.set(False)
+
     def _clear_auto_picks():
         pick_pts.set([]); reach_feat.set(None); auto_meta.set(None); last_click.set(None)
         for nm in ("pick1", "pick2", "Reach", "Upstream cap", "Downstream cap"):
@@ -1277,21 +1314,31 @@ def server(input, output, session):
                 ui.input_checkbox("use_kzones", "Use hydraulic-conductivity zones", value=False),
                 ui.panel_conditional(
                     "input.use_kzones === true",
-                    ui.div("Draw K-zone polygon(s) — each uses these values:",
-                           class_="hype-instr"),
+                    ui.div("Add one or more K-zone polygons (each uses these values); "
+                           "double-click a zone to edit it.", class_="hype-instr"),
                     ui.input_numeric("kzone_kh", "Zone KH (m/d)", value=50.0, min=0.0001, step=1.0),
                     ui.input_numeric("kzone_kv", "Zone KV (m/d)", value=5.0, min=0.0001, step=0.5),
+                    ui.div(
+                        ui.input_action_button("kz_add", "Add K-zone", class_="btn-sm btn-primary"),
+                        ui.input_action_button("kz_rmlast", "Remove last",
+                                               class_="btn-sm btn-outline-secondary"),
+                        ui.input_action_button("kz_clear", "Clear all",
+                                               class_="btn-sm btn-outline-secondary"),
+                        class_="hype-bnd-row"),
                     ui.output_ui("kzone_status")),
                 ui.div(ui.input_action_button("next_k", "Continue → Mesh", class_="btn-primary"),
                        class_="hype-actions"),
             )
         elif step == STEP_MESH:
             body = ui.TagList(
-                ui.div("Model grid — the estimate keeps the run in bounds.",
+                ui.div("Model grid — the live estimate below keeps the run in bounds.",
                        class_="hype-instr"),
-                ui.input_numeric("cell_size", "Cell size (m)", value=10.0, min=1.0, step=1.0),
-                ui.input_numeric("gw_mod_depth", "Model depth (m)", value=6.0, min=1.0, step=0.5),
-                ui.input_numeric("z", "Layer thickness (m)", value=0.25, min=0.05, step=0.05),
+                ui.input_numeric("cell_size", "Cell size (m) — smaller = finer grid", value=10.0,
+                                 min=1.0, step=1.0),
+                ui.input_numeric("gw_mod_depth", "Model depth below water surface (m)", value=6.0,
+                                 min=1.0, step=0.5),
+                ui.input_numeric("z", "Layer thickness (m) — depth ÷ thickness = layers", value=0.25,
+                                 min=0.05, step=0.05),
                 ui.output_ui("estimate_box"),
                 ui.div(ui.input_action_button("run_model", "Run model", class_="btn-primary"),
                        class_="hype-actions"),
@@ -1392,8 +1439,13 @@ def server(input, output, session):
     @render.ui
     def kzone_status():
         kn = len(kzone_feats())
-        return ui.p(f"{kn} K-zone polygon(s) drawn." if kn else
-                    "No K-zone polygons yet — draw them on the map.", class_="hype-chk ok" if kn else "hype-chk")
+        if kz_adding():
+            msg = "Drawing a K-zone — click on the map to place vertices."
+        elif kn:
+            msg = f"✓ {kn} K-zone polygon(s) — double-click one to edit."
+        else:
+            msg = "No K-zones yet — click Add K-zone."
+        return ui.p(msg, class_="hype-chk ok" if kn else "hype-chk")
 
     @render.ui
     def dem_status():
@@ -1414,7 +1466,12 @@ def server(input, output, session):
         est = grid_estimate()
         if not est:
             return None
-        return ui.div(estimate.band_message(est), class_=f"hype-estimate {estimate.band(est['n_cells'])}")
+        facts = (f"Domain ≈ {est['dom_w']:,.0f} × {est['dom_h']:,.0f} m · {est['nlay']} layers "
+                 f"({est['ncol']}×{est['nrow']} cells/layer)")
+        return ui.TagList(
+            ui.div(facts, class_="hype-chk"),
+            ui.div(estimate.band_message(est),
+                   class_=f"hype-estimate {estimate.band(est['n_cells'])}"))
 
     @render.ui
     def busy():
@@ -1501,20 +1558,23 @@ def server(input, output, session):
         # the Leaflet.draw toolbar (the control stays in the DOM — we click its anchors; its mouse
         # tooltip lives in the popup pane, so it still shows). Add a crosshair only while a pick or a
         # fresh draw is actually possible. Mirrors EASI's cursor_style pattern.
-        if not _HAS_MAP or current_step() not in (STEP_REACH, STEP_BOUNDARIES):
+        step = current_step()
+        if not _HAS_MAP or step not in (STEP_REACH, STEP_BOUNDARIES, STEP_K):
             return None
         css = ".hype-map-wrap .leaflet-draw{display:none !important;}"
-        if current_step() == STEP_REACH:
+        if step == STEP_REACH:
             z, _c = _view()
             no_reach = reach_feat() is None
             armed = delineate_mode() == "manual" and no_reach
             picking = (delineate_mode() == "auto" and no_reach and z is not None
                        and int(z) >= 12 and len(pick_pts()) < 2)
             crosshair = armed or picking
-        else:                                       # Boundaries — crosshair while drawing a fresh side
+        elif step == STEP_BOUNDARIES:               # crosshair while drawing a fresh side
             slot = bnd_slot()
             sv = _slot_value(slot) if slot else None
             crosshair = bool(slot) and (sv is None or sv() is None)
+        else:                                       # STEP_K — crosshair while adding a K-zone
+            crosshair = kz_adding()
         if crosshair:
             css += (".hype-map-wrap .leaflet-grab{cursor:crosshair !important;}"
                     ".hype-map-wrap .leaflet-container.leaflet-dragging,"
@@ -1551,6 +1611,11 @@ def server(input, output, session):
                 arm_shape = "polygon" if slot == "wse" else "line"
                 arm = not has
                 can_edit = has
+        elif step == STEP_K:
+            slot_id = "kzone"
+            arm_shape = "polygon"                 # K-zones are polygons; Add arms a fresh draw
+            arm = bool(kz_adding())
+            can_edit = (not kz_adding()) and len(kzone_feats()) > 0
         await session.send_custom_message("hype_reach", {
             "step": step, "slot": slot_id, "picking": bool(picking), "arm": bool(arm),
             "canEdit": bool(can_edit), "armShape": arm_shape,
