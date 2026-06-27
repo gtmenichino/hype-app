@@ -37,7 +37,7 @@ import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
 from hype_app import (bieger, bundle, delineate, dem, estimate, geocode, geometry, hydro,  # noqa: E402
-                      results)
+                      mesh, results)
 from hype_app import run as runner  # noqa: E402
 
 try:
@@ -97,6 +97,7 @@ app_ui = ui.page_fillable(
         ui.tags.link(rel="stylesheet", href="styles.css"),
         ui.tags.script(src="geocode.js"),
         ui.tags.script(src="reach_draw.js"),
+        ui.tags.script(src="mesh3d.js"),     # lazy-loads vtk.js from a CDN on first Compute
     ),
     ui.div(
         ui.div(
@@ -114,6 +115,8 @@ app_ui = ui.page_fillable(
         ui.output_ui("readout"),
         ui.output_ui("flow_loading"),
         ui.output_ui("map_edit_style"),
+        ui.div(id="hype-mesh3d", class_="hype-mesh3d"),     # 3D mesh viewer overlay (vtk.js)
+        ui.output_ui("mesh3d_style"),
         class_="hype-shell",
     ),
     title="HYPE — Hyporheic Exchange Explorer",
@@ -143,6 +146,7 @@ def server(input, output, session):
     down_feat = reactive.value(None)       # Downstream boundary LineString Feature
     bnd_slot = reactive.value(None)        # boundary being drawn/edited: up|left|right|down|wse|None
     kz_adding = reactive.value(False)      # True while a guided "Add K-zone" polygon draw is armed
+    mesh_geom = reactive.value(None)       # last computed 3D mesh geometry (for status + viewer)
     kzone_feats = reactive.value([])       # list of GeoJSON polygon features (4326)
     wse_extent_feat = reactive.value(None)  # drawn water-surface (wetted) extent polygon (4326)
     wse_mode_v = reactive.value("draw")     # mirror of the WSE-mode radio; persists across steps
@@ -806,6 +810,42 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             return None
 
+    # ---- 3D mesh preview (server builds geometry in pure numpy → vtk.js renders client-side) ----
+    @reactive.extended_task
+    async def mesh_task(domain_f, dem_p, crs, cell_size, depth, z) -> dict:
+        return await anyio.to_thread.run_sync(
+            lambda: mesh.build_grid_geometry(domain_f, dem_p, crs, cell_size, depth, z))
+
+    @reactive.effect
+    @reactive.event(input.compute_mesh)
+    def _compute_mesh():
+        build = _domain_build()
+        if not (build and dem_path() and proj_crs() is not None):
+            ui.notification_show("Need the four boundaries and terrain first.",
+                                 type="warning", duration=5)
+            return
+        stage.set("Building the 3D mesh…")
+        mesh_task(build["domain"], dem_path(), proj_crs(), float(_safe("cell_size", 10.0)),
+                  float(_safe("gw_mod_depth", 6.0)), float(_safe("z", 0.25)))
+
+    @reactive.effect
+    async def _mesh_done():
+        if mesh_task.status() in ("initial", "running"):
+            return
+        stage.set("")
+        if mesh_task.status() == "error":
+            try:
+                mesh_task.result()
+            except Exception as e:  # noqa: BLE001
+                ui.notification_show(f"Mesh build failed: {e}", type="error", duration=8)
+            return
+        try:
+            g = mesh_task.result()
+        except Exception:  # noqa: BLE001
+            return
+        mesh_geom.set(g)
+        await session.send_custom_message("hype_mesh", g)
+
     def _wse_path():
         """Resolve the WSE raster the engine will use: the uploaded raster, or the DEM clipped
         to the drawn wetted-extent polygon. Returns None if neither is available yet."""
@@ -1340,6 +1380,10 @@ def server(input, output, session):
                 ui.input_numeric("z", "Layer thickness (m) — depth ÷ thickness = layers", value=0.25,
                                  min=0.05, step=0.05),
                 ui.output_ui("estimate_box"),
+                ui.div(ui.input_action_button("compute_mesh", "Compute mesh (3D preview)",
+                                              class_="btn-sm btn-outline-secondary"),
+                       class_="hype-actions"),
+                ui.output_ui("mesh_status"),
                 ui.div(ui.input_action_button("run_model", "Run model", class_="btn-primary"),
                        class_="hype-actions"),
             )
@@ -1472,6 +1516,26 @@ def server(input, output, session):
             ui.div(facts, class_="hype-chk"),
             ui.div(estimate.band_message(est),
                    class_=f"hype-estimate {estimate.band(est['n_cells'])}"))
+
+    @render.ui
+    def mesh_status():
+        if mesh_task.status() == "running":
+            return ui.div(ui.div(class_="hype-spinner"), ui.span("Building 3D mesh…"),
+                          class_="hype-busy")
+        g = mesh_geom()
+        if not g:
+            return ui.p("Click Compute mesh to preview the grid in 3D.", class_="hype-chk")
+        f = g.get("decimation", 1)
+        note = "" if f == 1 else f" · shown at 1/{f} resolution"
+        return ui.p(f"✓ {g.get('nActiveFull', 0):,} active cells{note} — drag to orbit, "
+                    f"slider to slice.", class_="hype-chk ok")
+
+    @render.ui
+    def mesh3d_style():
+        # Reveal the vtk.js viewer overlay (over the map) only on the Mesh step.
+        if current_step() == STEP_MESH:
+            return ui.tags.style(".hype-mesh3d{display:block;}")
+        return None
 
     @render.ui
     def busy():
