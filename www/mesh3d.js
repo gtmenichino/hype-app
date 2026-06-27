@@ -78,13 +78,22 @@
   }
 
   function showHint(text) {
+    var el = container();
+    if (!el) return;
     if (!S.hint) {
       S.hint = document.createElement("div");
       S.hint.className = "hype-mesh3d-hint";
-      container().appendChild(S.hint);
+      el.appendChild(S.hint);
     }
     S.hint.textContent = text || "";
     S.hint.style.display = text ? "block" : "none";
+  }
+
+  // Guidance in the (otherwise blank dark) overlay on the Mesh step before anything is computed.
+  function idleHint() {
+    if (container() && !S.grw) {
+      showHint('Set the grid above, then click "Compute mesh" to build the 3D preview.');
+    }
   }
 
   function initOnce() {
@@ -199,4 +208,7 @@
     return false;
   }
   if (!register()) document.addEventListener("shiny:connected", register);
+  document.addEventListener("shiny:connected", idleHint);
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", idleHint);
+  else idleHint();
 })();
