@@ -341,6 +341,8 @@ def server(input, output, session):
             return
         step = current_step()
         dc = _draw_ctl.get("dc")
+        if step != STEP_REACH:                      # the auto-pick markers are Reach-only
+            _set_layer("pick1", None); _set_layer("pick2", None)
         with reactive.isolate():
             kz = list(kzone_feats()); rch = reach_feat(); mode = delineate_mode()
         if step == STEP_REACH:
@@ -416,6 +418,7 @@ def server(input, output, session):
         sv = _slot_value(slot)
         if match is not None and sv is not None:
             sv.set(match)
+            bnd_slot.set(None)          # commit done → deselect (line becomes a clickable static)
 
     def _load_into_drawcontrol(feats):
         """Put generated GeoJSON Features into the DrawControl so the user can edit them."""
@@ -717,6 +720,7 @@ def server(input, output, session):
                        "lat": r["lat"], "lon": r["lon"], **bf})
         reach_feat.set(r["reach"])
         _set_layer("Reach", GeoJSON(data=r["reach"], style=REACH_STYLE, name="Reach"))
+        _set_layer("pick1", None); _set_layer("pick2", None)   # drop the transient pick markers
         for w in r.get("warnings", []):
             ui.notification_show(w, duration=5)
         ui.notification_show(f"Reach {r['length_m']/1609.344:.2f} mi · drainage area "
@@ -1108,24 +1112,67 @@ def server(input, output, session):
                         ui.notification_show("Finish this step first.", type="warning", duration=4)
 
     @reactive.effect
-    def _bnd_select():
-        # Per-boundary buttons pick which boundary is editable (only that one loads into the
-        # DrawControl — see _sync_bnd_slot). Same strict-increment guard as _continue_nav so a
-        # leftpane re-render's count reset can't spuriously select; clicking the active one again
-        # deselects (finishes editing).
-        for bid, slot in (("bnd_up", "up"), ("bnd_left", "left"), ("bnd_right", "right"),
-                          ("bnd_down", "down"), ("bnd_wse", "wse")):
+    @reactive.event(last_click)
+    def _bnd_pick_on_click():
+        # Boundaries editing is map-driven: click on/near a boundary line to select + edit it.
+        # Only when nothing is being edited (else clicks add vertices via Leaflet.draw). Picks the
+        # nearest boundary within a zoom-scaled pixel tolerance (forgiving on thin lines).
+        if current_step() != STEP_BOUNDARIES or bnd_slot() is not None:
+            return
+        c = last_click(); crs = proj_crs()
+        if not c or crs is None:
+            return
+        cands = {"up": up_feat(), "left": left_feat(), "right": right_feat(),
+                 "down": down_feat(), "wse": wse_extent_feat()}
+        cands = {k: v for k, v in cands.items() if v}
+        if not cands:
+            return
+        import math
+        import geopandas as gpd
+        from shapely.geometry import Point, shape as _shape
+        try:
+            pt = gpd.GeoSeries([Point(float(c[1]), float(c[0]))], crs=4326).to_crs(crs).iloc[0]
+            best, best_d = None, None
+            for slot, f in cands.items():
+                g = gpd.GeoSeries([_shape(f["geometry"])], crs=4326).to_crs(crs).iloc[0]
+                d = pt.distance(g.boundary if g.geom_type == "Polygon" else g)
+                if best_d is None or d < best_d:
+                    best, best_d = slot, d
+            z = _view()[0] or 16
+            mpp = 156543.03 * math.cos(math.radians(float(c[0]))) / (2 ** int(z))
+            if best is not None and best_d <= 14 * mpp:           # ~14 px tolerance
+                bnd_slot.set(best)
+        except Exception:  # noqa: BLE001
+            return
+
+    @reactive.effect
+    @reactive.event(input.bnd_done)
+    def _bnd_done():
+        bnd_slot.set(None)              # "Done" → deselect; boundaries become clickable statics again
+
+    @reactive.effect
+    @reactive.event(input.bnd_clear)
+    def _bnd_clear():
+        with reactive.isolate():
+            sv = _slot_value(bnd_slot())
+        if sv is not None:
+            sv.set(None)                # "Clear & redraw" → empty the slot; _push then arms a draw
+
+    @reactive.effect
+    def _bnd_draw_links():
+        # The legend's "Draw" links (only shown on empty rows) select that slot → _push arms a draw.
+        # Strict-increment guard (legend re-renders, resetting link counts) — like _continue_nav.
+        for slot in ("up", "left", "right", "down", "wse"):
+            bid = f"bnd_draw_{slot}"
             try:
                 n = int(input[bid]() or 0)
             except Exception:  # noqa: BLE001
                 n = 0
-            last = _nav_seen.get(bid, 0)
-            if n != last:
+            if n != _nav_seen.get(bid, 0):
+                up = n > _nav_seen.get(bid, 0)
                 _nav_seen[bid] = n
-                if n > last:
-                    with reactive.isolate():
-                        cur = bnd_slot()
-                    bnd_slot.set(None if cur == slot else slot)
+                if up:
+                    bnd_slot.set(slot)
 
     @reactive.effect
     def _kz_buttons():
@@ -1298,20 +1345,12 @@ def server(input, output, session):
             )
         elif step == STEP_BOUNDARIES:
             body = ui.TagList(
-                ui.div("Generate the four boundaries from the reach, then click one to draw or edit "
-                       "it (double-click the line to edit). They close into the domain.",
-                       class_="hype-instr"),
+                ui.div("Generate the four boundaries from the reach, then click a boundary on the map "
+                       "to edit it — drag vertices, click midpoints to add.", class_="hype-instr"),
                 ui.input_select("fp_mult", "Floodplain extent = X × bankfull depth",
                                 {"2": "2×", "5": "5×", "10": "10× (default)"}, selected="10"),
                 ui.div(ui.input_action_button("regen", "Generate boundaries", class_="btn-primary"),
                        class_="hype-actions"),
-                ui.div("Draw / edit a boundary:", class_="hype-bnd-label"),
-                ui.div(
-                    ui.input_action_button("bnd_up", "Upstream", class_="btn-sm hype-bnd-btn hype-bnd-up"),
-                    ui.input_action_button("bnd_left", "Left FPL", class_="btn-sm hype-bnd-btn hype-bnd-left"),
-                    ui.input_action_button("bnd_right", "Right FPL", class_="btn-sm hype-bnd-btn hype-bnd-right"),
-                    ui.input_action_button("bnd_down", "Downstream", class_="btn-sm hype-bnd-btn hype-bnd-down"),
-                    class_="hype-bnd-row"),
                 ui.output_ui("draw_status"),
                 ui.input_radio_buttons(
                     "wse_mode", "Water surface (top boundary)",
@@ -1321,11 +1360,6 @@ def server(input, output, session):
                     "input.wse_mode === 'upload'",
                     ui.input_file("wse_upload", "WSE GeoTIFF", accept=[".tif", ".tiff"],
                                   multiple=False)),
-                ui.panel_conditional(
-                    "input.wse_mode === 'draw'",
-                    ui.div(ui.input_action_button("bnd_wse", "Draw / edit water surface",
-                                                  class_="btn-sm btn-outline-secondary"),
-                           class_="hype-actions")),
                 ui.input_select("bc_mode", "Boundary condition",
                                 {BC_CORNER: "4 corner gradients", BC_PROFILE: "Spatially varying"},
                                 selected=BC_CORNER),
@@ -1458,27 +1492,35 @@ def server(input, output, session):
 
     @render.ui
     def draw_status():
+        # Compact color legend — the boundaries are edited by clicking their lines on the map, so
+        # this is informational (swatch + name + ✓/○, active row highlighted); empty rows get a
+        # small "Draw" link as the only entry point when there's no line on the map to click.
         active = bnd_slot()
-        seq = [("Upstream boundary", up_feat() is not None),
-               ("Left FPL boundary", left_feat() is not None),
-               ("Right FPL boundary", right_feat() is not None),
-               ("Downstream boundary", down_feat() is not None)]
+        defs = [("up", "Upstream", UP_STYLE["color"], up_feat()),
+                ("left", "Left FPL", LEFT_STYLE["color"], left_feat()),
+                ("right", "Right FPL", RIGHT_STYLE["color"], right_feat()),
+                ("down", "Downstream", DOWN_STYLE["color"], down_feat())]
         if wse_mode_v() != "upload":
-            seq.append(("Water-surface extent", wse_extent_feat() is not None))
-        rows = [ui.div(("✓ " if ok else "○ ") + label,
-                       class_="hype-chk ok" if ok else "hype-chk") for label, ok in seq]
+            defs.append(("wse", "Water surface", WSE_STYLE["color"], wse_extent_feat()))
+        rows = []
+        for slot, label, color, feat in defs:
+            present = feat is not None
+            inner = [ui.span(class_="hype-leg-swatch", style=f"background:{color};"),
+                     ui.span(label, class_="hype-leg-name"),
+                     ui.span("✓" if present else "○",
+                             class_="hype-leg-mark ok" if present else "hype-leg-mark")]
+            if not present and active is None:
+                inner.append(ui.input_action_link(f"bnd_draw_{slot}", "Draw", class_="hype-leg-draw"))
+            rows.append(ui.div(*inner, class_="hype-leg-row" + (" active" if slot == active else "")))
         if active:
-            label = {"up": "Upstream", "left": "Left FPL", "right": "Right FPL",
-                     "down": "Downstream", "wse": "Water surface"}[active]
-            sv = _slot_value(active)
-            has = sv() is not None if sv is not None else False
-            hint = (f"Editing {label} — double-click the line to edit it."
-                    if has else f"Drawing {label} — click on the map to place vertices.")
+            hint = "Editing on the map — drag vertices, or use the bar to Clear & redraw / Done."
         elif _domain_build() is not None:
-            hint = "All four boundaries close into the domain — Continue to K, or click one to refine."
+            hint = "Click a boundary line on the map to edit it."
+        elif any(f is not None for *_, f in defs):
+            hint = "Click a boundary on the map to edit, or Generate boundaries."
         else:
-            hint = "Click Generate boundaries, or pick a boundary above to draw it."
-        return ui.div(ui.div(hint, class_="hype-instr"), *rows)
+            hint = "Click Generate boundaries to build the four sides."
+        return ui.div(ui.div(hint, class_="hype-instr"), ui.div(*rows, class_="hype-legend"))
 
     @render.ui
     def kzone_status():
@@ -1655,7 +1697,7 @@ def server(input, output, session):
             return
         step = current_step()
         z, _c = _view()
-        picking = arm = can_edit = False
+        picking = arm = can_edit = auto_edit = False
         arm_shape = "line"
         slot_id = None
         if step == STEP_REACH:
@@ -1664,7 +1706,7 @@ def server(input, output, session):
             picking = (mode == "auto" and no_reach and z is not None and int(z) >= 12
                        and len(pick_pts()) < 2)
             arm = mode == "manual" and no_reach
-            can_edit = mode == "manual" and not no_reach
+            can_edit = mode == "manual" and not no_reach          # double-click to edit the centerline
             slot_id = "reach" if mode == "manual" else None
         elif step == STEP_BOUNDARIES:
             slot = bnd_slot()
@@ -1673,8 +1715,9 @@ def server(input, output, session):
                 sv = _slot_value(slot)
                 has = sv() is not None if sv is not None else False
                 arm_shape = "polygon" if slot == "wse" else "line"
-                arm = not has
-                can_edit = has
+                arm = not has                                     # empty slot → draw it
+                auto_edit = has                                   # selected existing line → edit now
+                can_edit = has                                    # + double-click fallback
         elif step == STEP_K:
             slot_id = "kzone"
             arm_shape = "polygon"                 # K-zones are polygons; Add arms a fresh draw
@@ -1682,7 +1725,9 @@ def server(input, output, session):
             can_edit = (not kz_adding()) and len(kzone_feats()) > 0
         await session.send_custom_message("hype_reach", {
             "step": step, "slot": slot_id, "picking": bool(picking), "arm": bool(arm),
-            "canEdit": bool(can_edit), "armShape": arm_shape,
+            "canEdit": bool(can_edit), "autoEdit": bool(auto_edit), "armShape": arm_shape,
+            "slotName": {"up": "Upstream", "left": "Left FPL", "right": "Right FPL",
+                         "down": "Downstream", "wse": "Water surface"}.get(slot_id, ""),
         })
 
 

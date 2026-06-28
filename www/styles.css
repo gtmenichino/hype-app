@@ -63,16 +63,33 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-chk { font-size: 13px; color: var(--hype-muted); padding: 2px 0; }
 .hype-chk.ok { color: var(--hype-good); font-weight: 600; }
 
-/* ---- per-boundary draw/edit buttons (color-coded to match the map layers) ---- */
-.hype-bnd-label { font-size: 12px; font-weight: 600; color: var(--hype-label); margin: 12px 0 4px; }
+/* ---- small button row (K-zone Add / Remove / Clear) ---- */
 .hype-bnd-row { display: flex; flex-wrap: wrap; gap: 6px; }
-.hype-bnd-btn { flex: 1 1 46%; background: #fff; border: 1px solid var(--hype-card-border);
-  border-left-width: 4px; color: var(--hype-text); font-size: 12px; padding: 4px 8px; }
-.hype-bnd-btn:hover { background: var(--hype-surface-soft); }
-.hype-bnd-up    { border-left-color: #f08c00; }
-.hype-bnd-left  { border-left-color: #1f6feb; }
-.hype-bnd-right { border-left-color: #d83933; }
-.hype-bnd-down  { border-left-color: #9b59b6; }
+
+/* ---- boundary legend (Boundaries step; lines are edited by clicking them on the map) ---- */
+.hype-legend { margin: 8px 0 2px; border: 1px solid var(--hype-rule); border-radius: 6px; overflow: hidden; }
+.hype-leg-row { display: flex; align-items: center; gap: 8px; padding: 5px 9px; font-size: 12.5px;
+  color: var(--hype-text); border-top: 1px solid var(--hype-rule); }
+.hype-leg-row:first-child { border-top: none; }
+.hype-leg-row.active { background: #eef3fb; font-weight: 600; }
+.hype-leg-swatch { width: 16px; height: 3px; border-radius: 2px; flex: none; }
+.hype-leg-name { flex: 1; }
+.hype-leg-mark { color: var(--hype-muted); font-weight: 600; }
+.hype-leg-mark.ok { color: var(--hype-good); }
+.hype-leg-draw { font-size: 12px; }
+
+/* ---- floating boundary edit bar over the map ---- */
+.hype-edit-bar { position: absolute; left: calc(50% + 168px); bottom: 16px; transform: translateX(-50%);
+  z-index: 1150; display: flex; align-items: center; gap: 10px; background: rgba(255, 255, 255, .97);
+  border: 1px solid var(--hype-card-border); border-radius: 10px; box-shadow: 0 2px 12px rgba(20, 40, 80, .22);
+  padding: 7px 12px; font-size: 12.5px; color: var(--hype-text); }
+.hype-edit-label { font-weight: 600; }
+.hype-edit-btn { font-size: 12px; padding: 3px 10px; border: 1px solid var(--hype-card-border);
+  background: #fff; border-radius: 5px; cursor: pointer; }
+.hype-edit-btn:hover { background: var(--hype-surface-soft); }
+.hype-edit-btn.primary { background: var(--hype-accent); border-color: var(--hype-accent); color: #fff; }
+.hype-edit-btn.primary:hover { background: var(--hype-accent-dark); border-color: var(--hype-accent-dark); }
+
 .hype-warn { font-size: 12px; color: #9a6700; background: #fff8e1; border: 1px solid #ffe0a3;
   border-radius: 6px; padding: 6px 8px; margin-top: 10px; }
 

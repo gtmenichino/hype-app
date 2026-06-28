@@ -21,8 +21,9 @@
 
   var WRAP = ".hype-map-wrap";
   var PICK_TEXT = "Click to select a point on a stream.";
-  var state = { picking: false, arm: false, canEdit: false, step: null, slot: null, armShape: "line" };
-  var tip = null;
+  var state = { picking: false, arm: false, canEdit: false, autoEdit: false,
+                step: null, slot: null, slotName: "", armShape: "line" };
+  var tip = null, bar = null;
 
   // ---- DOM helpers (all scoped to the map wrapper) ----
   function wrap() { return document.querySelector(WRAP); }
@@ -96,26 +97,73 @@
     else click(saveLink());                                  // commit edits
   }
 
+  function setInput(name) {
+    if (window.Shiny && Shiny.setInputValue) Shiny.setInputValue(name, Date.now(), { priority: "event" });
+  }
+
+  // Auto-enter Leaflet.draw edit for a just-selected boundary. A short delay lets the server's
+  // dc.data load arrive first (so the layer is in the edit featureGroup); double-click is the
+  // fallback if the timing is missed.
+  function scheduleEnterEdit() {
+    setTimeout(function () {
+      if (state.autoEdit && !isEditing()) click(q(".leaflet-draw-edit-edit"));
+    }, 400);
+  }
+
+  // ---- floating boundary edit bar (Clear & redraw / Done) ----
+  function ensureBar() {
+    if (bar) return bar;
+    bar = document.createElement("div");
+    bar.className = "hype-edit-bar";
+    bar.style.display = "none";
+    bar.innerHTML = '<span class="hype-edit-label"></span>' +
+      '<button type="button" data-k="clear" class="hype-edit-btn">Clear &amp; redraw</button>' +
+      '<button type="button" data-k="done" class="hype-edit-btn primary">Done</button>';
+    bar.addEventListener("click", function (e) {
+      var k = e.target && e.target.getAttribute("data-k");
+      if (k === "done") { if (isEditing()) click(saveLink()); cancelDraw(); setInput("bnd_done"); }
+      else if (k === "clear") { setInput("bnd_clear"); }
+    });
+    (wrap() || document.body).appendChild(bar);
+    return bar;
+  }
+  function showBar(mode, name) {
+    var b = ensureBar();
+    b.querySelector(".hype-edit-label").textContent = (mode === "draw" ? "Drawing " : "Editing ") + name;
+    b.querySelector('[data-k="clear"]').style.display = mode === "draw" ? "none" : "";
+    b.querySelector('[data-k="done"]').textContent = mode === "draw" ? "Cancel" : "Done";
+    b.style.display = "flex";
+  }
+  function hideBar() { if (bar) bar.style.display = "none"; }
+
   // ---- apply the latest server state (idempotent; guards keep redundant messages harmless) ----
   function reconcile() {
     if (!state.picking) hideTip();
     if (state.arm) arm(0); else cancelDraw();
-    if (!state.canEdit && isEditing()) click(saveLink());    // commit before leaving the step/mode
+    if (!state.canEdit && !state.autoEdit && isEditing()) click(saveLink());  // commit before leaving
+    var onBnd = state.step === "boundaries" && !!state.slot;
+    if (onBnd && state.autoEdit) showBar("edit", state.slotName || "boundary");
+    else if (onBnd && state.arm) showBar("draw", state.slotName || "boundary");
+    else hideBar();
   }
 
   function onMessage(s) {
     var nextSlot = s.slot || null;
-    if (nextSlot !== state.slot) {        // switching target → commit/cancel any in-progress work
+    var slotChanged = nextSlot !== state.slot;
+    if (slotChanged) {                    // switching target → commit/cancel any in-progress work
       if (isEditing()) click(saveLink());
       if (isDrawing()) cancelDraw();
     }
     state.slot = nextSlot;
+    state.slotName = s.slotName || "";
     state.armShape = s.armShape || "line";
     state.picking = !!s.picking;
     state.arm = !!s.arm;
     state.canEdit = !!s.canEdit;
+    state.autoEdit = !!s.autoEdit;
     state.step = s.step;
     reconcile();
+    if (slotChanged && state.autoEdit) scheduleEnterEdit();   // single-click select → edit now
   }
 
   // ---- wiring ----
