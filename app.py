@@ -379,6 +379,21 @@ def server(input, output, session):
             _mirror_features_as_layers()
 
     @reactive.effect
+    def _dem_backdrop_by_step():
+        # The DEM hillshade (light terrain colormap, opacity 0.8) is a DEM-tab backdrop only. Off the
+        # DEM step it washes the basemap pale and — stacking above the early-added DrawControl —
+        # buries the boundary line you select to edit. Hide it everywhere except DEM (live opacity
+        # trait, same as the head overlay; no rebuild, and opacity 0 also neutralizes the z-order).
+        step = current_step()          # read FIRST so the effect subscribes even before the DEM
+        lyr = _layers.get("dem")       # overlay exists (else the early return skips the dependency
+        if lyr is None:                # and it never re-runs when the hillshade later appears).
+            return
+        try:
+            lyr.opacity = 0.8 if step == STEP_DEM else 0.0
+        except Exception:  # noqa: BLE001
+            pass
+
+    @reactive.effect
     def _sync_bnd_slot():
         # Owns the Boundaries-step map: load ONLY the active boundary into the DrawControl (so
         # Leaflet.draw never has to disambiguate four similar lines) and mirror the rest as statics.
