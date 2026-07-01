@@ -305,7 +305,7 @@ def server(input, output, session):
             "type": "FeatureCollection", "features": [feat]}
 
     _MIRROR_NAMES = ("Domain", "Water-surface extent", "Left boundary", "Right boundary",
-                     "Upstream boundary", "Downstream boundary", "K-zones", "Reach")
+                     "Upstream boundary", "Downstream boundary", "K-zones", "Reach", "Boundary labels")
     # Boundary slot → (map-layer name, style). The active slot lives in the DrawControl; the rest
     # render as static colored layers so all four sides stay visible while you edit one.
     _BND_STATIC = {"up": ("Upstream boundary", UP_STYLE), "left": ("Left boundary", LEFT_STYLE),
@@ -347,6 +347,45 @@ def server(input, output, session):
         _bnd_shown[nm] = sig
         _set_layer(nm, GeoJSON(data=_fc(feat), style=style, name=nm) if feat is not None else None)
 
+    _BND_LABELS = {"up": ("Upstream", UP_STYLE["color"]), "left": ("Left FPL", LEFT_STYLE["color"]),
+                   "right": ("Right FPL", RIGHT_STYLE["color"]), "down": ("Downstream", DOWN_STYLE["color"])}
+
+    def _label_point(feat, polygon=False):
+        """A (lat, lon) anchor to place a boundary's label: the polygon's representative point, or the
+        LineString's mid-arc point. None if the geometry can't be read."""
+        try:
+            from shapely.geometry import shape as _shape
+            g = _shape((feat or {}).get("geometry") or {})
+            if g.is_empty:
+                return None
+            p = g.representative_point() if polygon else g.interpolate(0.5, normalized=True)
+            return (float(p.y), float(p.x))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _label_marker(pt, text, color):
+        """A non-interactive DivIcon label pill centred on `pt` (pointer-events:none so it never
+        intercepts the map clicks that select a boundary line)."""
+        html = ('<div style="transform:translate(-50%,-50%);pointer-events:none;'
+                'font:600 11px/1.1 system-ui,-apple-system,sans-serif;white-space:nowrap;'
+                'padding:1px 5px;border-radius:3px;background:rgba(255,255,255,.82);'
+                f'color:{color};border:1px solid {color}">{text}</div>')
+        return Marker(location=pt, draggable=False,
+                      icon=DivIcon(html=html, icon_size=[0, 0], icon_anchor=[0, 0]))
+
+    def _render_boundary_labels(feats, wse):
+        """One toggleable 'Boundary labels' LayerGroup naming each present side + the WSE polygon."""
+        markers = []
+        for slot, (text, color) in _BND_LABELS.items():
+            pt = _label_point(feats.get(slot)) if feats.get(slot) else None
+            if pt:
+                markers.append(_label_marker(pt, text, color))
+        wpt = _label_point(wse, polygon=True) if wse else None
+        if wpt:
+            markers.append(_label_marker(wpt, "Water surface", WSE_STYLE["color"]))
+        _set_layer("Boundary labels",
+                   LayerGroup(layers=markers, name="Boundary labels") if markers else None)
+
     def _render_boundaries(active):
         """Boundaries-step display: each side except the `active` one (which is in the DrawControl)
         as a static colored layer, plus the derived domain, the WSE (unless active), and the reach.
@@ -361,6 +400,7 @@ def server(input, output, session):
         _bnd_show("Water-surface extent", wse if active != "wse" else None, WSE_STYLE)
         _bnd_show("Reach", rch, REACH_STYLE)
         _bnd_show("K-zones", None, KZONE_STYLE)
+        _render_boundary_labels(feats, wse)
 
     @reactive.effect
     def _sync_map_shapes():
@@ -431,13 +471,18 @@ def server(input, output, session):
         _render_boundaries(slot)
 
     @reactive.effect
-    def _refresh_domain_outline():
-        # Keep the derived-domain outline live as sides are edited (the calc tracks the four slots).
-        # Route through _bnd_show so the Domain layer's tracked signature stays in sync with the
-        # rest of the Boundaries overlays (idempotent — no churn when the domain is unchanged).
+    def _refresh_boundary_display():
+        # Re-render the boundary statics + labels whenever ANY feature changes (e.g. "Snap corners
+        # together" rewrites all four sides, or a committed edit changes one) — not just the derived
+        # Domain outline. Without this, Snap-corners updated the features but the side lines stayed at
+        # their old positions on the map. Idempotent via _bnd_show, so unchanged layers aren't touched.
         if not _HAS_MAP or current_step() != STEP_BOUNDARIES:
             return
-        _bnd_show("Domain", domain_feat(), DOMAIN_STYLE)
+        up_feat(); left_feat(); right_feat(); down_feat()      # subscribe to every boundary feature so
+        wse_extent_feat(); reach_feat(); domain_feat()          # Snap-corners / edits re-render the lines
+        with reactive.isolate():
+            slot = bnd_slot()
+        _render_boundaries(slot)
 
     @reactive.effect
     def _frame_boundaries_on_entry():
