@@ -87,6 +87,20 @@ RUN_STEPS = {0: "Preparing terrain & geometry…", 1: "Preprocessing",
              4: "Computing boundary heads", 5: "Running MODFLOW 6 + MODPATH 7",
              6: "Post-processing pathlines", 7: "Exporting head layers"}
 
+_WWW = Path(__file__).parent / "www"
+
+
+def _asset(name: str) -> str:
+    """Append the file's mtime as a cache-busting ?v= so browsers re-fetch our static assets after
+    any edit. Shiny serves styles.css / *.js with no version, so browsers cache them hard and keep
+    using the stale copy across server restarts — which is why a fixed CSS/JS silently didn't apply
+    (a restarted server serves the new file, but the browser never re-requests it)."""
+    try:
+        v = int(_WWW.joinpath(name).stat().st_mtime)
+    except OSError:
+        v = 0
+    return f"{name}?v={v}"
+
 
 app_ui = ui.page_fillable(
     ui.head_content(
@@ -94,10 +108,10 @@ app_ui = ui.page_fillable(
         ui.tags.link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin=""),
         ui.tags.link(rel="stylesheet",
                      href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"),
-        ui.tags.link(rel="stylesheet", href="styles.css"),
-        ui.tags.script(src="geocode.js"),
-        ui.tags.script(src="reach_draw.js"),
-        ui.tags.script(src="mesh3d.js"),     # lazy-loads vtk.js from a CDN on first Compute
+        ui.tags.link(rel="stylesheet", href=_asset("styles.css")),
+        ui.tags.script(src=_asset("geocode.js")),
+        ui.tags.script(src=_asset("reach_draw.js")),
+        ui.tags.script(src=_asset("mesh3d.js")),     # lazy-loads vtk.js from a CDN on first Compute
     ),
     ui.div(
         ui.div(
