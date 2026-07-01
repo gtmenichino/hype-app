@@ -468,7 +468,7 @@ def server(input, output, session):
         with reactive.isolate():
             sv = _slot_value(slot)
             active_feat = sv() if sv is not None else None
-        _load_into_drawcontrol([active_feat] if active_feat else [])
+        _load_into_drawcontrol([_edit_feature(active_feat, slot)] if active_feat else [])
         _render_boundaries(slot)
 
     @reactive.effect
@@ -589,8 +589,23 @@ def server(input, output, session):
         if match is not None and sv is not None:
             if slot != "wse":
                 match = _snap_boundary_endpoints(slot, match)   # snap ends onto nearby neighbour ends
-            sv.set(match)
+            if isinstance(match.get("properties"), dict):
+                match["properties"].pop("style", None)   # drop the edit-only colour (see _edit_feature)
+            sv.set(match)                                 # so stored features stay pristine for statics/engine
             bnd_slot.set(None)          # commit done → deselect (line becomes a clickable static)
+
+    def _edit_feature(feat, slot):
+        """Copy `feat` with the slot's own colour baked into properties.style, so the line keeps its
+        colour while loaded in the DrawControl for editing. Without this the DrawControl paints the
+        loaded feature Leaflet's default #3388ff blue — indistinguishable from the Left FPL line.
+        ipyleaflet's DrawControl honours per-feature properties.style (the same field it writes when
+        persisting a drawn shape), so this is the styling hook for loaded-for-edit geometry."""
+        if not feat:
+            return feat
+        base = WSE_STYLE if slot == "wse" else _BND_STATIC.get(slot, ("", REACH_STYLE))[1]
+        props = dict(feat.get("properties") or {})
+        props["style"] = {**base, "weight": max(4, int(base.get("weight", 3)) + 1)}
+        return {"type": "Feature", "properties": props, "geometry": feat.get("geometry")}
 
     def _load_into_drawcontrol(feats):
         """Put generated GeoJSON Features into the DrawControl so the user can edit them."""

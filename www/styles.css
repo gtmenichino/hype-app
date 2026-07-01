@@ -32,8 +32,17 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-map-wrap .leaflet-container { height: 100% !important; width: 100% !important; }
 
 /* On-map labels: drop Leaflet's default DivIcon box (ipyleaflet DivIcon has no className), then draw
-   a clean pill via .hype-map-label. `color` (set inline per label) drives the text + border. */
-.hype-map-wrap .leaflet-div-icon { background: transparent; border: 0; box-shadow: none; }
+   a clean pill via .hype-map-label. `color` (set inline per label) drives the text + border.
+   :not(.leaflet-editing-icon) is critical — Leaflet.draw's vertex/midpoint edit handles are ALSO
+   .leaflet-div-icon and rely on that default box to be the visible square, so excluding them keeps
+   the drag handles from being neutralized into invisible transparent squares. */
+.hype-map-wrap .leaflet-div-icon:not(.leaflet-editing-icon) { background: transparent; border: 0; box-shadow: none; }
+
+/* Leaflet.draw vertex + midpoint edit handles — crisp white square with an accent ring so the
+   points you drag while editing a boundary are unmistakable. */
+.hype-map-wrap .leaflet-editing-icon {
+  background: #fff; border: 2px solid var(--hype-accent); border-radius: 3px;
+  box-shadow: 0 1px 3px rgba(20, 40, 80, .35); box-sizing: border-box; opacity: 1; }
 .hype-map-label { display: inline-block; transform: translate(-50%, -50%); white-space: nowrap;
   font: 600 11px/1.15 "Instrument Sans", system-ui, -apple-system, sans-serif;
   padding: 2px 7px; border-radius: 10px; background: #fff; border: 1px solid currentColor;
