@@ -31,6 +31,14 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-map-wrap .jupyter-widgets { height: 100% !important; width: 100% !important; }
 .hype-map-wrap .leaflet-container { height: 100% !important; width: 100% !important; }
 
+/* On-map labels: drop Leaflet's default DivIcon box (ipyleaflet DivIcon has no className), then draw
+   a clean pill via .hype-map-label. `color` (set inline per label) drives the text + border. */
+.hype-map-wrap .leaflet-div-icon { background: transparent; border: 0; box-shadow: none; }
+.hype-map-label { display: inline-block; transform: translate(-50%, -50%); white-space: nowrap;
+  font: 600 11px/1.15 "Instrument Sans", system-ui, -apple-system, sans-serif;
+  padding: 2px 7px; border-radius: 10px; background: #fff; border: 1px solid currentColor;
+  box-shadow: 0 1px 3px rgba(20, 40, 80, .28); pointer-events: none; }
+
 /* ---- header ---- */
 .hype-header { position: absolute; top: 0; left: 0; right: 0; height: var(--hype-header-h); z-index: 1200;
   display: flex; align-items: center; justify-content: space-between; padding: 0 16px;

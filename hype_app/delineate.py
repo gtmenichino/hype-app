@@ -20,15 +20,18 @@ CRS_ALBERS = 5070  # work in metres (USGS CONUS Albers)
 
 
 def _normal(line, s, ds=5.0):
-    """Unit vector perpendicular to `line` at station `s` (metres), via a centred
-    difference so it's stable at the endpoints. Returns (point, (nx, ny))."""
+    """Unit vector perpendicular to `line` at station `s` (metres), via a centred difference so it's
+    stable at the endpoints. Returns (point, (nx, ny)) with the normal pointing to the RIGHT of the
+    downstream direction of travel, so `_edge_offsets`' `ro >= 0` side is the true right bank and
+    `lo <= 0` the true left bank (projected CRS is x=east, y=north). Rotating the tangent 90° CW is
+    `(dy, -dx)`; the earlier `(-dy, dx)` was 90° CCW = left, which swapped Left/Right FPL."""
     L = line.length
     s0 = max(0.0, min(float(s), L))
     a = line.interpolate(max(0.0, s0 - ds))
     b = line.interpolate(min(L, s0 + ds))
     dx, dy = b.x - a.x, b.y - a.y
     n = (dx * dx + dy * dy) ** 0.5 or 1.0
-    return line.interpolate(s0), (-dy / n, dx / n)
+    return line.interpolate(s0), (dy / n, -dx / n)
 
 
 def _edge_offsets(dem, line, s, *, half, n_samp, rel_height, depth_bf, chan_half):

@@ -364,12 +364,11 @@ def server(input, output, session):
             return None
 
     def _label_marker(pt, text, color):
-        """A non-interactive DivIcon label pill centred on `pt` (pointer-events:none so it never
-        intercepts the map clicks that select a boundary line)."""
-        html = ('<div style="transform:translate(-50%,-50%);pointer-events:none;'
-                'font:600 11px/1.1 system-ui,-apple-system,sans-serif;white-space:nowrap;'
-                'padding:1px 5px;border-radius:3px;background:rgba(255,255,255,.82);'
-                f'color:{color};border:1px solid {color}">{text}</div>')
+        """A non-interactive label pill centred on `pt`. Styling lives in `.hype-map-label`
+        (styles.css) — ipyleaflet's DivIcon has no class_name to drop Leaflet's default box, so that
+        default is neutralized in CSS and the pill is drawn by our class. `color` drives the text and
+        (via currentColor) the border; pointer-events:none so it never intercepts line-select clicks."""
+        html = f'<div class="hype-map-label" style="color:{color}">{text}</div>'
         return Marker(location=pt, draggable=False,
                       icon=DivIcon(html=html, icon_size=[0, 0], icon_anchor=[0, 0]))
 
