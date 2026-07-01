@@ -387,15 +387,17 @@ def server(input, output, session):
 
     def _render_boundaries(active):
         """Boundaries-step display: each side except the `active` one (which is in the DrawControl)
-        as a static colored layer, plus the derived domain, the WSE (unless active), and the reach.
-        Idempotent via `_bnd_show`, so re-running on a slot change only touches what actually
-        changed (the active line moving in/out of the DrawControl) — never a full clear + re-add."""
+        as a static colored layer, plus the WSE (unless active) and the reach. Idempotent via
+        `_bnd_show`, so re-running on a slot change only touches what actually changed (the active
+        line moving in/out of the DrawControl) — never a full clear + re-add. The derived-domain gold
+        ring is intentionally NOT drawn here: the four coloured sides already trace the domain, and
+        drawing it on top masked their distinct legend colours (worse after edits re-stacked it)."""
         with reactive.isolate():
             feats = {"up": up_feat(), "left": left_feat(), "right": right_feat(), "down": down_feat()}
-            wse = wse_extent_feat(); dom = domain_feat(); rch = reach_feat()
+            wse = wse_extent_feat(); rch = reach_feat()
         for slot, (nm, style) in _BND_STATIC.items():
             _bnd_show(nm, feats[slot] if slot != active else None, style)
-        _bnd_show("Domain", dom, DOMAIN_STYLE)
+        _bnd_show("Domain", None, DOMAIN_STYLE)   # clear any domain ring carried in from another step
         _bnd_show("Water-surface extent", wse if active != "wse" else None, WSE_STYLE)
         _bnd_show("Reach", rch, REACH_STYLE)
         _bnd_show("K-zones", None, KZONE_STYLE)
