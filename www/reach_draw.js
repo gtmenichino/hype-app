@@ -101,13 +101,17 @@
     if (window.Shiny && Shiny.setInputValue) Shiny.setInputValue(name, Date.now(), { priority: "event" });
   }
 
-  // Auto-enter Leaflet.draw edit for a just-selected boundary. A short delay lets the server's
-  // dc.data load arrive first (so the layer is in the edit featureGroup); double-click is the
-  // fallback if the timing is missed.
+  // Auto-enter Leaflet.draw edit for a just-selected boundary. An initial delay lets the server's
+  // dc.data load arrive first (so the layer is in the edit featureGroup); then retry until edit mode
+  // actually engages, in case that sync is still in flight. Aborts if the slot was deselected;
+  // double-click (canEdit) remains the manual fallback.
   function scheduleEnterEdit() {
-    setTimeout(function () {
-      if (state.autoEdit && !isEditing()) click(q(".leaflet-draw-edit-edit"));
-    }, 400);
+    var tries = 0;
+    setTimeout(function attempt() {
+      if (!state.autoEdit || isEditing()) return;                  // deselected, or already editing
+      click(q(".leaflet-draw-edit-edit"));                         // enter vertex editing
+      if (!isEditing() && tries++ < 8) setTimeout(attempt, 200);   // retry until it engages (~1.9s)
+    }, 350);
   }
 
   // ---- floating boundary edit bar (Clear & redraw / Done) ----

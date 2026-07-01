@@ -202,6 +202,9 @@ def server(input, output, session):
 
     _layers: dict = {}
     _draw_ctl: dict = {}                     # holds the DrawControl so effects can clear it
+    _bnd_shown: dict = {}                    # Boundaries step: per-layer signature (see _bnd_show)
+    _map_ui: dict = {}                       # small map-view bookkeeping (last step seen, …)
+    _MISSING = object()                      # sentinel: "layer not tracked yet" vs "tracked as None"
 
     def _set_layer(key, layer):
         old = _layers.get(key)
@@ -316,22 +319,33 @@ def server(input, output, session):
     def _clear_mirror_layers():
         for nm in _MIRROR_NAMES:
             _set_layer(nm, None)
+        _bnd_shown.clear()
+
+    def _bnd_show(nm, feat, style):
+        # Idempotent layer set for the Boundaries step: only rebuild `nm` when the shown feature
+        # actually changed (tracked by object identity — features are replaced wholesale, never
+        # mutated). This keeps *selecting* a boundary from removing + re-adding every other overlay
+        # on each click; that churn (and the all-cleared transient) is what briefly blanked the map.
+        sig = id(feat) if feat is not None else None
+        if _bnd_shown.get(nm, _MISSING) == sig:
+            return
+        _bnd_shown[nm] = sig
+        _set_layer(nm, GeoJSON(data=_fc(feat), style=style, name=nm) if feat is not None else None)
 
     def _render_boundaries(active):
         """Boundaries-step display: each side except the `active` one (which is in the DrawControl)
-        as a static colored layer, plus the derived domain, the WSE (unless active), and the reach."""
+        as a static colored layer, plus the derived domain, the WSE (unless active), and the reach.
+        Idempotent via `_bnd_show`, so re-running on a slot change only touches what actually
+        changed (the active line moving in/out of the DrawControl) — never a full clear + re-add."""
         with reactive.isolate():
             feats = {"up": up_feat(), "left": left_feat(), "right": right_feat(), "down": down_feat()}
             wse = wse_extent_feat(); dom = domain_feat(); rch = reach_feat()
         for slot, (nm, style) in _BND_STATIC.items():
-            f = feats[slot] if slot != active else None
-            _set_layer(nm, GeoJSON(data=_fc(f), style=style, name=nm) if f else None)
-        _set_layer("Domain", GeoJSON(data=_fc(dom), style=DOMAIN_STYLE, name="Domain") if dom else None)
-        wse_show = wse if active != "wse" else None
-        _set_layer("Water-surface extent", GeoJSON(data=_fc(wse_show), style=WSE_STYLE,
-                   name="Water-surface extent") if wse_show else None)
-        _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
-        _set_layer("K-zones", None)
+            _bnd_show(nm, feats[slot] if slot != active else None, style)
+        _bnd_show("Domain", dom, DOMAIN_STYLE)
+        _bnd_show("Water-surface extent", wse if active != "wse" else None, WSE_STYLE)
+        _bnd_show("Reach", rch, REACH_STYLE)
+        _bnd_show("K-zones", None, KZONE_STYLE)
 
     @reactive.effect
     def _sync_map_shapes():
@@ -368,6 +382,8 @@ def server(input, output, session):
     def _sync_bnd_slot():
         # Owns the Boundaries-step map: load ONLY the active boundary into the DrawControl (so
         # Leaflet.draw never has to disambiguate four similar lines) and mirror the rest as statics.
+        # `_render_boundaries` is idempotent, so selecting a slot only swaps the one active line in/
+        # out of the DrawControl — it never clears + re-adds every overlay (which blanked the map).
         if not _HAS_MAP:
             return
         step = current_step()
@@ -376,8 +392,8 @@ def server(input, output, session):
             if slot is not None:
                 with reactive.isolate():
                     bnd_slot.set(None)             # reset when leaving so re-entry starts clean
+            _bnd_shown.clear()                     # rebuild cleanly on the next entry
             return
-        _clear_mirror_layers()
         with reactive.isolate():
             sv = _slot_value(slot)
             active_feat = sv() if sv is not None else None
@@ -387,10 +403,22 @@ def server(input, output, session):
     @reactive.effect
     def _refresh_domain_outline():
         # Keep the derived-domain outline live as sides are edited (the calc tracks the four slots).
+        # Route through _bnd_show so the Domain layer's tracked signature stays in sync with the
+        # rest of the Boundaries overlays (idempotent — no churn when the domain is unchanged).
         if not _HAS_MAP or current_step() != STEP_BOUNDARIES:
             return
-        dom = domain_feat()
-        _set_layer("Domain", GeoJSON(data=_fc(dom), style=DOMAIN_STYLE, name="Domain") if dom else None)
+        _bnd_show("Domain", domain_feat(), DOMAIN_STYLE)
+
+    @reactive.effect
+    def _frame_boundaries_on_entry():
+        # Frame the derived domain when the user *lands* on the Boundaries step (step transition
+        # only — not on every slot change), so the lines aren't hidden behind the left panel and it
+        # never fights the user's pan/zoom mid-edit.
+        step = current_step()
+        prev = _map_ui.get("step")
+        _map_ui["step"] = step
+        if _HAS_MAP and step == STEP_BOUNDARIES and prev not in (None, STEP_BOUNDARIES):
+            _fit_domain()
 
     def _reclassify_drawn():
         """Re-derive feature values from the DrawControl's shapes, routed by step: Reach (manual) →
@@ -479,6 +507,24 @@ def server(input, output, session):
         @reactive.calc
         def _view():
             return reactive_read(_MAP, "zoom"), reactive_read(_MAP, "center")
+
+        def _fit_domain():
+            """Frame the derived domain in the *visible* map area. The left ~336 px is the app panel,
+            so a small domain can otherwise sit hidden behind it. ipyleaflet's fit_bounds has no
+            padding arg, so pad the bounds manually and bias west (extra left padding) to push the
+            domain toward the right, visible half of the map."""
+            with reactive.isolate():
+                g = _domain_gdf_4326()
+            if g is None:
+                return
+            minx, miny, maxx, maxy = (float(v) for v in g.total_bounds)
+            dx = (maxx - minx) or 1e-4
+            dy = (maxy - miny) or 1e-4
+            b = [[miny - 0.25 * dy, minx - 0.9 * dx], [maxy + 0.25 * dy, maxx + 0.25 * dx]]
+            try:
+                _MAP.fit_bounds(b)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- DEM fetch ----
     @reactive.extended_task
@@ -762,6 +808,8 @@ def server(input, output, session):
             _render_boundaries(None)
         else:                                  # generated before reaching Boundaries → show statics
             _mirror_features_as_layers()
+        if _HAS_MAP:
+            _fit_domain()                      # frame the fresh domain clear of the left panel
         ui.notification_show("Domain, boundaries & wetted extent generated — open the Boundaries tab "
                              "to review/edit each boundary.", duration=8)
 
@@ -1157,6 +1205,12 @@ def server(input, output, session):
             sv = _slot_value(bnd_slot())
         if sv is not None:
             sv.set(None)                # "Clear & redraw" → empty the slot; _push then arms a draw
+            dc = _draw_ctl.get("dc")    # drop the old shape now so the fresh draw starts from empty
+            if dc is not None:          # (else it lingers and _reclassify picks it, not the new one)
+                try:
+                    dc.clear(); dc.data = []
+                except Exception:  # noqa: BLE001
+                    pass
 
     @reactive.effect
     def _bnd_draw_links():
