@@ -95,6 +95,9 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 
 .hype-warn { font-size: 12px; color: #9a6700; background: #fff8e1; border: 1px solid #ffe0a3;
   border-radius: 6px; padding: 6px 8px; margin-top: 10px; }
+.hype-warn-btn { margin-top: 7px; font-size: 12px; font-weight: 600; padding: 4px 12px;
+  color: #7a5200; background: #ffe6a8; border: 1px solid #e6b64d; border-radius: 5px; cursor: pointer; }
+.hype-warn-btn:hover { background: #ffdc8a; }
 
 .hype-estimate { font-size: 12.5px; padding: 8px 10px; border-radius: 6px; margin-top: 12px; line-height: 1.35; }
 .hype-estimate.green { background: #e7f7ec; color: #1a7f37; border: 1px solid #b7e3c3; }

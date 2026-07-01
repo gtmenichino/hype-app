@@ -493,9 +493,9 @@ def server(input, output, session):
             ep_idx = [0, len(coords) - 1]
             lonlat = [tuple(coords[i][:2]) for i in ep_idx] + neighbours
             proj = list(gpd.GeoSeries([Point(lo, la) for lo, la in lonlat], crs=4326).to_crs(crs))
-            z = _view()[0] or 16
-            mpp = 156543.03 * math.cos(math.radians(float(coords[0][1]))) / (2 ** int(z))
-            tol = 16.0 * mpp
+            z = getattr(_MAP, "zoom", None) or 16   # read the trait directly — on_draw isn't reactive,
+            mpp = 156543.03 * math.cos(math.radians(float(coords[0][1]))) / (2 ** int(z))  # so _view() (a
+            tol = 28.0 * mpp                        # reactive.calc) could raise here and silently no-op
             n = len(ep_idx)
             for j, i in enumerate(ep_idx):
                 p = proj[j]
@@ -1326,6 +1326,25 @@ def server(input, output, session):
                     bnd_slot.set(slot)
 
     @reactive.effect
+    def _snap_corners():
+        # "Snap corners together" (open-domain warning) → write the assembled snapped sides back so the
+        # four corners coincide and the domain closes. Strict-increment guard (button lives in the
+        # re-rendered domain_warning, so a plain @reactive.event would re-fire on the count reset).
+        try:
+            n = int(input.snap_corners() or 0)
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n != _nav_seen.get("snap_corners", 0):
+            up = n > _nav_seen.get("snap_corners", 0)
+            _nav_seen["snap_corners"] = n
+            if up:
+                with reactive.isolate():
+                    b = _domain_build()
+                if b:
+                    up_feat.set(b["up"]); left_feat.set(b["left"])
+                    right_feat.set(b["right"]); down_feat.set(b["down"])
+
+    @reactive.effect
     def _kz_buttons():
         # K-zone list management (same strict-increment guard as _continue_nav so leftpane
         # re-render resets don't fire): Add → arm a guided polygon draw; Remove last / Clear all.
@@ -1684,8 +1703,11 @@ def server(input, output, session):
         gap = geometry.corner_gaps_m(up_feat(), left_feat(), right_feat(), down_feat())
         if gap is None or gap <= 25.0:
             return None
-        return ui.div(f"⚠ Boundaries don't meet at a corner (gap ≈ {gap:.0f} m). Drag an endpoint onto "
-                      "the neighbouring line, or Clear & redraw so they close.", class_="hype-warn")
+        return ui.div(
+            ui.div(f"⚠ Boundaries don't meet at a corner (gap ≈ {gap:.0f} m). Drag an endpoint onto the "
+                   "neighbouring line to connect them, or:"),
+            ui.input_action_button("snap_corners", "Snap corners together", class_="hype-warn-btn"),
+            class_="hype-warn")
 
     @render.ui
     def kzone_status():
