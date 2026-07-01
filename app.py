@@ -159,6 +159,7 @@ def server(input, output, session):
     right_feat = reactive.value(None)      # Right FPL boundary LineString Feature
     down_feat = reactive.value(None)       # Downstream boundary LineString Feature
     bnd_slot = reactive.value(None)        # boundary being drawn/edited: up|left|right|down|wse|None
+    bnd_commit = reactive.value(0)         # ++ to ask the client to Save the active edit (legend Save)
     kz_adding = reactive.value(False)      # True while a guided "Add K-zone" polygon draw is armed
     mesh_geom = reactive.value(None)       # last computed 3D mesh geometry (for status + viewer)
     kzone_feats = reactive.value([])       # list of GeoJSON polygon features (4326)
@@ -1326,6 +1327,29 @@ def server(input, output, session):
                     bnd_slot.set(slot)
 
     @reactive.effect
+    def _bnd_edit_buttons():
+        # Legend per-row Edit/Save links: "Edit" (row not active) → select that slot (enter edit,
+        # same as clicking the line); "Save" (active row) → bump bnd_commit so the client clicks
+        # Leaflet's Save (→ draw:edited → _reclassify_drawn saves + deselects, the floating-bar path).
+        # Strict-increment guard (legend re-renders, resetting link counts) — like _bnd_draw_links.
+        for slot in ("up", "left", "right", "down", "wse"):
+            bid = f"bnd_edit_{slot}"
+            try:
+                n = int(input[bid]() or 0)
+            except Exception:  # noqa: BLE001
+                n = 0
+            if n != _nav_seen.get(bid, 0):
+                up = n > _nav_seen.get(bid, 0)
+                _nav_seen[bid] = n
+                if up:
+                    with reactive.isolate():
+                        active = bnd_slot()
+                    if active == slot:
+                        bnd_commit.set(bnd_commit() + 1)   # Save → client commits the active edit
+                    else:
+                        bnd_slot.set(slot)                 # Edit → enter edit for this boundary
+
+    @reactive.effect
     def _snap_corners():
         # "Snap corners together" (open-domain warning) → write the assembled snapped sides back so the
         # four corners coincide and the domain closes. Strict-increment guard (button lives in the
@@ -1680,7 +1704,10 @@ def server(input, output, session):
                      ui.span(label, class_="hype-leg-name"),
                      ui.span("✓" if present else "○",
                              class_="hype-leg-mark ok" if present else "hype-leg-mark")]
-            if not present and active is None:
+            if present:
+                inner.append(ui.input_action_link(f"bnd_edit_{slot}",
+                             "Save" if slot == active else "Edit", class_="hype-leg-edit"))
+            elif active is None:
                 inner.append(ui.input_action_link(f"bnd_draw_{slot}", "Draw", class_="hype-leg-draw"))
             rows.append(ui.div(*inner, class_="hype-leg-row" + (" active" if slot == active else "")))
         if active:
@@ -1913,6 +1940,7 @@ def server(input, output, session):
         await session.send_custom_message("hype_reach", {
             "step": step, "slot": slot_id, "picking": bool(picking), "arm": bool(arm),
             "canEdit": bool(can_edit), "autoEdit": bool(auto_edit), "armShape": arm_shape,
+            "commit": int(bnd_commit()),      # ++ from the legend "Save" link → client clicks Save
             "slotName": {"up": "Upstream", "left": "Left FPL", "right": "Right FPL",
                          "down": "Downstream", "wse": "Water surface"}.get(slot_id, ""),
         })

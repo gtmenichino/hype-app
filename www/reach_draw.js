@@ -114,6 +114,18 @@
     }, 350);
   }
 
+  // Commit the active edit and finish. Save commits it → draw:edited → the server saves the edited
+  // geometry (from the event payload) and deselects. Firing bnd_done immediately would race the edit
+  // and clear the slot first, dropping the change. Fallback: if NOTHING was edited, no draw:edited
+  // fires, so deselect after a beat — but only if the server still has us selected (a real edit
+  // clears state.slot first via reclassify, so this can't drop it). Shared by the floating-bar Done
+  // and the legend "Save" link.
+  function finishEdit() {
+    if (isEditing()) click(saveLink());
+    if (doneTimer) clearTimeout(doneTimer);
+    doneTimer = setTimeout(function () { doneTimer = null; if (state.slot) setInput("bnd_done"); }, 700);
+  }
+
   // ---- floating boundary edit bar (Clear & redraw / Done) ----
   function ensureBar() {
     if (bar) return bar;
@@ -126,16 +138,8 @@
     bar.addEventListener("click", function (e) {
       var k = e.target && e.target.getAttribute("data-k");
       if (k === "done") {
-        if (isEditing()) {
-          // Save commits the edit → draw:edited → the server saves the edited geometry (from the
-          // event payload) and deselects. Firing bnd_done immediately would race the edit and clear
-          // the slot first, dropping the change. Fallback: if NOTHING was edited, no draw:edited
-          // fires, so deselect after a beat — but only if the server still has us selected (a real
-          // edit clears state.slot first, so this can't drop it).
-          click(saveLink());
-          if (doneTimer) clearTimeout(doneTimer);
-          doneTimer = setTimeout(function () { doneTimer = null; if (state.slot) setInput("bnd_done"); }, 700);
-        } else { cancelDraw(); setInput("bnd_done"); }
+        if (isEditing()) finishEdit();
+        else { cancelDraw(); setInput("bnd_done"); }
       } else if (k === "clear") { setInput("bnd_clear"); }
     });
     (wrap() || document.body).appendChild(bar);
@@ -177,6 +181,12 @@
     state.canEdit = !!s.canEdit;
     state.autoEdit = !!s.autoEdit;
     state.step = s.step;
+    // Legend "Save" link bumps `commit` (slot unchanged) → commit the active edit, exactly like the
+    // floating-bar Done: click Leaflet Save → draw:edited → server saves the geometry + deselects.
+    if (typeof s.commit === "number") {
+      if (state.lastCommit !== undefined && s.commit > state.lastCommit && isEditing()) finishEdit();
+      state.lastCommit = s.commit;
+    }
     reconcile();
     if (slotChanged && state.autoEdit) scheduleEnterEdit();   // single-click select → edit now
   }

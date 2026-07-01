@@ -80,6 +80,8 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-leg-mark { color: var(--hype-muted); font-weight: 600; }
 .hype-leg-mark.ok { color: var(--hype-good); }
 .hype-leg-draw { font-size: 12px; }
+.hype-leg-edit { font-size: 12px; margin-left: 4px; font-weight: 600; }
+.hype-leg-row.active .hype-leg-edit { color: var(--hype-good); }
 
 /* ---- floating boundary edit bar over the map ---- */
 .hype-edit-bar { position: absolute; left: calc(50% + 168px); bottom: 16px; transform: translateX(-50%);
