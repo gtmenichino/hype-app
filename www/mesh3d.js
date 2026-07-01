@@ -13,8 +13,9 @@
   "use strict";
 
   var CID = "hype-mesh3d";
-  var S = { grw: null, ren: null, rw: null, mapper: null, actor: null, plane: null,
-            clipping: false, axis: 0, t: 0, vexag: 1, bounds: null, bar: null, hint: null };
+  var S = { grw: null, ren: null, rw: null, mappers: [], actors: [], plane: null,
+            clipping: false, axis: 0, t: 0, vexag: 1, bounds: null, bar: null, hint: null,
+            scalarBar: null, omw: null };
 
   function container() { return document.getElementById(CID); }
   function V() { return window.vtk; }
@@ -26,7 +27,7 @@
   }
 
   function applyClip() {
-    if (!S.mapper || !S.plane || !S.bounds) return;
+    if (!S.mappers || !S.mappers.length || !S.plane || !S.bounds) return;
     var ext = axisExtent(S.bounds, S.axis);
     var origin = [(S.bounds[0] + S.bounds[1]) / 2,
                   (S.bounds[2] + S.bounds[3]) / 2,
@@ -36,12 +37,12 @@
     S.plane.setOrigin(origin);
     S.plane.setNormal(normal);
     var want = S.t > 0.001;
-    if (want && !S.clipping) { S.mapper.addClippingPlane(S.plane); S.clipping = true; }
-    else if (!want && S.clipping) { S.mapper.removeClippingPlane(S.plane); S.clipping = false; }
+    if (want && !S.clipping) { S.mappers.forEach(function (m) { m.addClippingPlane(S.plane); }); S.clipping = true; }
+    else if (!want && S.clipping) { S.mappers.forEach(function (m) { m.removeClippingPlane(S.plane); }); S.clipping = false; }
   }
 
   function applyVexag() {
-    if (S.actor) S.actor.setScale(1, 1, S.vexag);
+    (S.actors || []).forEach(function (a) { a.setScale(1, 1, S.vexag); });
     applyClip();
   }
 
@@ -55,7 +56,7 @@
       '<label>Slice <select data-k="axis"><option value="0">X</option>' +
       '<option value="1">Y</option><option value="2">Z</option></select></label>' +
       '<label><input type="range" data-k="clip" min="0" max="1" step="0.01" value="0"></label>' +
-      '<label>Vert × <input type="range" data-k="vexag" min="1" max="50" step="1" value="1">' +
+      '<label>Vert × <input type="range" data-k="vexag" min="1" max="5" step="1" value="1">' +
       '<span data-k="vexagval">1</span></label>' +
       '<button data-k="reset">Reset view</button>';
     bar.addEventListener("input", function (e) {
@@ -69,9 +70,16 @@
       render();
     });
     bar.addEventListener("click", function (e) {
-      if (e.target.getAttribute("data-k") === "reset" && S.ren) {
-        S.ren.resetCamera(); render();
-      }
+      if (e.target.getAttribute("data-k") !== "reset") return;
+      S.axis = 0; S.t = 0; S.vexag = 1;                    // reset slice + vertical-exaggeration state
+      var q = function (k) { return bar.querySelector('[data-k="' + k + '"]'); };
+      if (q("axis")) q("axis").value = "0";
+      if (q("clip")) q("clip").value = 0;
+      if (q("vexag")) q("vexag").value = 1;
+      if (q("vexagval")) q("vexagval").textContent = "1";
+      applyVexag();                                        // re-scale z→1 + applyClip() (t=0 drops the plane)
+      if (S.ren) { S.ren.resetCamera(); S.ren.resetCameraClippingRange(); }
+      render();
     });
     container().appendChild(bar);
     S.bar = bar;
@@ -116,48 +124,86 @@
     if (!initOnce()) { showHint("3D viewer failed to load."); return; }
     var vtk = V();
     showHint("");
-    if (S.actor) { S.ren.removeActor(S.actor); S.actor = null; S.clipping = false; }
+    (S.actors || []).forEach(function (a) { S.ren.removeActor(a); });   // clear any prior mesh
+    S.actors = []; S.mappers = []; S.clipping = false;
 
     // This vtk.js build ships vtkPolyData (not vtkUnstructuredGrid), so expand each active hex
-    // (8 corner ids: 0-3 = bottom face, 4-7 = top face) to its 6 quad faces — clips cleanly and
-    // shows the layer colour on the cut. Geometry stays bounded by the server's max_cells budget.
-    var src = msg.cells, layerArr = msg.cellLayer, nHex = msg.nHex;
+    // (8 corner ids: 0-3 = bottom face, 4-7 = top face) to its 6 quad faces — clips cleanly on a cut.
+    // Split into two meshes: the TOP layer (terrain-coloured by elevation) and the deeper BODY (a
+    // neutral-gray block), so the ground surface shows topography while the block below stays quiet.
+    var src = msg.cells, elevArr = msg.cellElev, layArr = msg.cellLayer, nHex = msg.nHex;
     var FACES = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4],
                  [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]];
-    var polys = new Uint32Array(nHex * 6 * 5);
-    var faceLayer = new Float32Array(nHex * 6);
-    var p = 0, fi = 0;
+    var topPolys = [], topElev = [], bodyPolys = [];
     for (var h = 0; h < nHex; h++) {
-      var base = h * 8, lay = layerArr[h];
+      var base = h * 8, ev = elevArr[h], isTop = layArr[h] === 0;
       for (var f = 0; f < 6; f++) {
         var fc = FACES[f];
-        polys[p++] = 4;
-        polys[p++] = src[base + fc[0]]; polys[p++] = src[base + fc[1]];
-        polys[p++] = src[base + fc[2]]; polys[p++] = src[base + fc[3]];
-        faceLayer[fi++] = lay;
+        var q = [4, src[base + fc[0]], src[base + fc[1]], src[base + fc[2]], src[base + fc[3]]];
+        if (isTop) { topPolys.push(q[0], q[1], q[2], q[3], q[4]); topElev.push(ev); }
+        else { bodyPolys.push(q[0], q[1], q[2], q[3], q[4]); }
       }
     }
-    var pd = vtk.Common.DataModel.vtkPolyData.newInstance();
-    pd.getPoints().setData(Float32Array.from(msg.points), 3);
-    pd.getPolys().setData(polys);
-    pd.getCellData().setScalars(vtk.Common.Core.vtkDataArray.newInstance(
-      { name: "layer", values: faceLayer, numberOfComponents: 1 }));
-    var maxLayer = (msg.previewDims && msg.previewDims.nlay) ? msg.previewDims.nlay - 1 : 1;
+    var ptsData = Float32Array.from(msg.points);
 
-    var mapper = vtk.Rendering.Core.vtkMapper.newInstance({ scalarVisibility: true });
-    mapper.setInputData(pd);
-    if (mapper.setScalarModeToUseCellData) mapper.setScalarModeToUseCellData();
-    mapper.setScalarRange(0, Math.max(1, maxLayer));
-    var lut = mapper.getLookupTable();
-    if (lut && lut.setHueRange) { lut.setHueRange(0.62, 0.0); lut.setSaturationRange(0.7, 0.9); }
+    // Terrain colour ramp over the elevation range (full resolution; applied to the top mesh only).
+    var rng = msg.elevRange || [0, 1], elo = rng[0], ehi = rng[1], ed = (ehi - elo) || 1;
+    var ctf = vtk.Rendering.Core.vtkColorTransferFunction.newInstance();
+    ctf.addRGBPoint(elo, 0.27, 0.45, 0.29);                 // low  — green
+    ctf.addRGBPoint(elo + 0.40 * ed, 0.55, 0.60, 0.32);     //      — yellow-green
+    ctf.addRGBPoint(elo + 0.65 * ed, 0.80, 0.74, 0.46);     //      — tan
+    ctf.addRGBPoint(elo + 0.85 * ed, 0.58, 0.44, 0.32);     //      — brown
+    ctf.addRGBPoint(ehi, 0.95, 0.95, 0.92);                 // high — near-white
 
-    var actor = vtk.Rendering.Core.vtkActor.newInstance();
-    actor.setMapper(mapper);
-    var prop = actor.getProperty();
-    if (prop.setEdgeVisibility) { prop.setEdgeVisibility(true); prop.setEdgeColor(0.16, 0.18, 0.22); }
-    S.ren.addActor(actor);
+    function addMesh(polysArr, scalars, rgb) {
+      if (!polysArr.length) return;
+      var pd = vtk.Common.DataModel.vtkPolyData.newInstance();
+      pd.getPoints().setData(ptsData, 3);
+      pd.getPolys().setData(Uint32Array.from(polysArr));
+      var mapper = vtk.Rendering.Core.vtkMapper.newInstance();
+      mapper.setInputData(pd);
+      if (scalars) {
+        pd.getCellData().setScalars(vtk.Common.Core.vtkDataArray.newInstance(
+          { name: "elev", values: Float32Array.from(scalars), numberOfComponents: 1 }));
+        mapper.setScalarVisibility(true);
+        if (mapper.setScalarModeToUseCellData) mapper.setScalarModeToUseCellData();
+        mapper.setLookupTable(ctf);
+        mapper.setScalarRange(elo, ehi);
+      } else {
+        mapper.setScalarVisibility(false);
+      }
+      var actor = vtk.Rendering.Core.vtkActor.newInstance();
+      actor.setMapper(mapper);
+      var prop = actor.getProperty();
+      if (rgb) prop.setColor(rgb[0], rgb[1], rgb[2]);
+      if (prop.setEdgeVisibility) { prop.setEdgeVisibility(true); prop.setEdgeColor(0.16, 0.18, 0.22); }
+      S.ren.addActor(actor);
+      S.actors.push(actor); S.mappers.push(mapper);
+    }
+    addMesh(bodyPolys, null, [0.56, 0.58, 0.61]);           // neutral-gray body
+    addMesh(topPolys, topElev, null);                       // terrain-coloured top surface
 
-    S.mapper = mapper; S.actor = actor; S.bounds = msg.bounds;
+    // Elevation legend (scalar bar) — created once; its colour map tracks the current mesh.
+    if (!S.scalarBar && vtk.Rendering.Core.vtkScalarBarActor) {
+      S.scalarBar = vtk.Rendering.Core.vtkScalarBarActor.newInstance();
+      if (S.scalarBar.setAxisLabel) S.scalarBar.setAxisLabel("Elevation (m)");
+      S.ren.addActor(S.scalarBar);
+    }
+    if (S.scalarBar && S.scalarBar.setScalarsToColors) S.scalarBar.setScalarsToColors(ctf);
+
+    // X/Y/Z orientation gizmo (bottom-right), created once.
+    if (!S.omw && vtk.Interaction.Widgets.vtkOrientationMarkerWidget && S.rw.getInteractor) {
+      var axes = vtk.Rendering.Core.vtkAxesActor.newInstance();
+      S.omw = vtk.Interaction.Widgets.vtkOrientationMarkerWidget.newInstance(
+        { actor: axes, interactor: S.rw.getInteractor() });
+      S.omw.setEnabled(true);
+      var Corners = vtk.Interaction.Widgets.vtkOrientationMarkerWidget.Corners;
+      S.omw.setViewportCorner(Corners ? Corners.BOTTOM_RIGHT : 1);
+      S.omw.setViewportSize(0.15);
+      if (S.omw.setMinPixelSize) S.omw.setMinPixelSize(80);
+    }
+
+    S.bounds = msg.bounds;
     S.plane = vtk.Common.DataModel.vtkPlane.newInstance({ normal: [1, 0, 0], origin: [0, 0, 0] });
     S.t = 0; if (S.bar) S.bar.querySelector('[data-k="clip"]').value = 0;
     applyVexag();
