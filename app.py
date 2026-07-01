@@ -449,20 +449,39 @@ def server(input, output, session):
         if _HAS_MAP and step == STEP_BOUNDARIES and prev not in (None, STEP_BOUNDARIES):
             _fit_domain()
 
-    def _reclassify_drawn():
-        """Re-derive feature values from the DrawControl's shapes, routed by step: Reach (manual) →
+    def _features_of(gj):
+        """Feature dicts from an on_draw `geo_json` payload (Feature / FeatureCollection / bare
+        geometry). On an EDIT, ipyleaflet hands the fresh edited geometry here but does NOT update
+        dc.data at the same time (that trait syncs via a separate, unordered message), so this is the
+        reliable source for a just-committed shape — reading dc.data would re-save the old geometry."""
+        if not isinstance(gj, dict):
+            return []
+        t = gj.get("type")
+        if t == "FeatureCollection":
+            return [f for f in (gj.get("features") or []) if isinstance(f, dict)]
+        if t == "Feature":
+            return [gj]
+        if gj.get("coordinates") is not None:              # bare geometry
+            return [{"type": "Feature", "properties": {}, "geometry": gj}]
+        return []
+
+    def _reclassify_drawn(action=None, geo_json=None):
+        """Re-derive feature values from the just-drawn/edited shape, routed by step: Reach (manual) →
         the drawn line is the reach centerline; K → polygons are K-zones; Boundaries → the single
-        shape goes to the active boundary slot (up/left/right/down = line, wse = polygon)."""
+        shape goes to the active boundary slot (up/left/right/down = line, wse = polygon). Prefer the
+        fresh `geo_json` from the draw event; dc.data is stale on edits (see _features_of)."""
         dc = _draw_ctl.get("dc")
-        feats = list(getattr(dc, "data", None) or [])
+        data_feats = list(getattr(dc, "data", None) or [])
+        fresh = _features_of(geo_json)
         step = current_step()
         if step == STEP_REACH:
-            lines = [f for f in feats if (f.get("geometry") or {}).get("type") == "LineString"]
+            src = fresh or data_feats
+            lines = [f for f in src if (f.get("geometry") or {}).get("type") == "LineString"]
             if delineate_mode() == "manual" and lines:
                 reach_feat.set(lines[0])
             return
         if step == STEP_K:
-            kzone_feats.set([f for f in feats if (f.get("geometry") or {}).get("type") == "Polygon"])
+            kzone_feats.set([f for f in data_feats if (f.get("geometry") or {}).get("type") == "Polygon"])
             kz_adding.set(False)             # a guided "Add K-zone" draw just completed
             return
         if step != STEP_BOUNDARIES:
@@ -471,7 +490,8 @@ def server(input, output, session):
         if not slot:
             return
         want = "Polygon" if slot == "wse" else "LineString"
-        match = next((f for f in feats if (f.get("geometry") or {}).get("type") == want), None)
+        src = fresh or data_feats
+        match = next((f for f in src if (f.get("geometry") or {}).get("type") == want), None)
         sv = _slot_value(slot)
         if match is not None and sv is not None:
             sv.set(match)
@@ -512,7 +532,7 @@ def server(input, output, session):
             _draw_ctl["dc"] = dc
 
             def _on_draw(target, action, geo_json):
-                _reclassify_drawn()        # re-derive features from the DrawControl's current shapes
+                _reclassify_drawn(action=action, geo_json=geo_json)  # re-derive from the drawn shape
 
             dc.on_draw(_on_draw)
             m.add(dc)

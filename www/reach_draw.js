@@ -125,8 +125,17 @@
       '<button type="button" data-k="done" class="hype-edit-btn primary">Done</button>';
     bar.addEventListener("click", function (e) {
       var k = e.target && e.target.getAttribute("data-k");
-      if (k === "done") { if (isEditing()) click(saveLink()); cancelDraw(); setInput("bnd_done"); }
-      else if (k === "clear") { setInput("bnd_clear"); }
+      if (k === "done") {
+        if (isEditing()) {
+          // Save commits the edit → draw:edited → the server saves the edited geometry (from the
+          // event payload) and deselects. Firing bnd_done immediately would race the edit and clear
+          // the slot first, dropping the change. Fallback: if NOTHING was edited, no draw:edited
+          // fires, so deselect after a beat — but only if the server still has us selected (a real
+          // edit clears state.slot first, so this can't drop it).
+          click(saveLink());
+          setTimeout(function () { if (state.slot) setInput("bnd_done"); }, 700);
+        } else { cancelDraw(); setInput("bnd_done"); }
+      } else if (k === "clear") { setInput("bnd_clear"); }
     });
     (wrap() || document.body).appendChild(bar);
     return bar;
