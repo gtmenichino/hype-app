@@ -23,7 +23,7 @@
   var PICK_TEXT = "Click to select a point on a stream.";
   var state = { picking: false, arm: false, canEdit: false, autoEdit: false,
                 step: null, slot: null, slotName: "", armShape: "line" };
-  var tip = null, bar = null;
+  var tip = null, bar = null, doneTimer = null;
 
   // ---- DOM helpers (all scoped to the map wrapper) ----
   function wrap() { return document.querySelector(WRAP); }
@@ -133,7 +133,8 @@
           // fires, so deselect after a beat — but only if the server still has us selected (a real
           // edit clears state.slot first, so this can't drop it).
           click(saveLink());
-          setTimeout(function () { if (state.slot) setInput("bnd_done"); }, 700);
+          if (doneTimer) clearTimeout(doneTimer);
+          doneTimer = setTimeout(function () { doneTimer = null; if (state.slot) setInput("bnd_done"); }, 700);
         } else { cancelDraw(); setInput("bnd_done"); }
       } else if (k === "clear") { setInput("bnd_clear"); }
     });
@@ -164,8 +165,9 @@
     var nextSlot = s.slot || null;
     var slotChanged = nextSlot !== state.slot;
     if (slotChanged) {                    // switching target → commit/cancel any in-progress work
-      if (isEditing()) click(saveLink());
-      if (isDrawing()) cancelDraw();
+      if (doneTimer) { clearTimeout(doneTimer); doneTimer = null; }  // a fresh pick cancels a pending
+      if (isEditing()) click(saveLink());                            // Done fallback so it can't
+      if (isDrawing()) cancelDraw();                                 // deselect the new selection
     }
     state.slot = nextSlot;
     state.slotName = s.slotName || "";

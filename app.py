@@ -465,6 +465,52 @@ def server(input, output, session):
             return [{"type": "Feature", "properties": {}, "geometry": gj}]
         return []
 
+    def _snap_boundary_endpoints(slot, feat):
+        """Snap the committed boundary line's two endpoints onto the nearest endpoint of the OTHER
+        three boundaries when within a zoom-scaled tolerance (~16 px), so shared corners actually
+        meet. Returns the (possibly snapped) Feature — unchanged if there's no projected CRS yet or
+        nothing is close. Reuses the px→m metric from _bnd_pick_on_click."""
+        geom = (feat or {}).get("geometry") or {}
+        if geom.get("type") != "LineString":
+            return feat
+        coords = [list(c) for c in (geom.get("coordinates") or [])]
+        crs = proj_crs()
+        if len(coords) < 2 or crs is None:
+            return feat
+        neighbours = []
+        for k, v in {"up": up_feat, "left": left_feat, "right": right_feat, "down": down_feat}.items():
+            if k == slot:
+                continue
+            c = (((v() or {}).get("geometry") or {}).get("coordinates")) or []
+            if len(c) >= 2:
+                neighbours.append(tuple(c[0][:2])); neighbours.append(tuple(c[-1][:2]))
+        if not neighbours:
+            return feat
+        try:
+            import math
+            import geopandas as gpd
+            from shapely.geometry import Point
+            ep_idx = [0, len(coords) - 1]
+            lonlat = [tuple(coords[i][:2]) for i in ep_idx] + neighbours
+            proj = list(gpd.GeoSeries([Point(lo, la) for lo, la in lonlat], crs=4326).to_crs(crs))
+            z = _view()[0] or 16
+            mpp = 156543.03 * math.cos(math.radians(float(coords[0][1]))) / (2 ** int(z))
+            tol = 16.0 * mpp
+            n = len(ep_idx)
+            for j, i in enumerate(ep_idx):
+                p = proj[j]
+                best_d, best_k = None, None
+                for m in range(len(neighbours)):
+                    d = p.distance(proj[n + m])
+                    if best_d is None or d < best_d:
+                        best_d, best_k = d, m
+                if best_d is not None and best_d <= tol:
+                    coords[i] = list(neighbours[best_k])       # snap endpoint onto the neighbour
+            return {"type": "Feature", "properties": (feat or {}).get("properties") or {},
+                    "geometry": {"type": "LineString", "coordinates": coords}}
+        except Exception:  # noqa: BLE001
+            return feat
+
     def _reclassify_drawn(action=None, geo_json=None):
         """Re-derive feature values from the just-drawn/edited shape, routed by step: Reach (manual) →
         the drawn line is the reach centerline; K → polygons are K-zones; Boundaries → the single
@@ -494,6 +540,8 @@ def server(input, output, session):
         match = next((f for f in src if (f.get("geometry") or {}).get("type") == want), None)
         sv = _slot_value(slot)
         if match is not None and sv is not None:
+            if slot != "wse":
+                match = _snap_boundary_endpoints(slot, match)   # snap ends onto nearby neighbour ends
             sv.set(match)
             bnd_slot.set(None)          # commit done → deselect (line becomes a clickable static)
 
@@ -1455,6 +1503,7 @@ def server(input, output, session):
                 ui.div(ui.input_action_button("regen", "Generate boundaries", class_="btn-primary"),
                        class_="hype-actions"),
                 ui.output_ui("draw_status"),
+                ui.output_ui("domain_warning"),
                 ui.input_radio_buttons(
                     "wse_mode", "Water surface (top boundary)",
                     {"draw": "Wetted extent (auto / drawn)", "upload": "Upload a WSE raster"},
@@ -1624,6 +1673,19 @@ def server(input, output, session):
         else:
             hint = "Click Generate boundaries to build the four sides."
         return ui.div(ui.div(hint, class_="hype-instr"), ui.div(*rows, class_="hype-legend"))
+
+    @render.ui
+    def domain_warning():
+        # Warn when the four boundaries don't meet at a corner. The derived domain still force-closes
+        # for the model run, but a big gap means the user's lines are disconnected — guide them to fix
+        # it. (Snapping auto-connects near endpoints; this catches the ones too far apart to snap.)
+        if not _HAS_MAP or current_step() != STEP_BOUNDARIES:
+            return None
+        gap = geometry.corner_gaps_m(up_feat(), left_feat(), right_feat(), down_feat())
+        if gap is None or gap <= 25.0:
+            return None
+        return ui.div(f"⚠ Boundaries don't meet at a corner (gap ≈ {gap:.0f} m). Drag an endpoint onto "
+                      "the neighbouring line, or Clear & redraw so they close.", class_="hype-warn")
 
     @render.ui
     def kzone_status():

@@ -6,7 +6,7 @@ model therefore runs in metres (length_units='meters').
 """
 from __future__ import annotations
 
-from math import hypot
+from math import cos, hypot, radians
 from typing import Iterable, Optional
 
 import geopandas as gpd
@@ -114,3 +114,26 @@ def assemble_domain_from_sides(up, left, right, down) -> Optional[dict]:
         "up": _feat(LineString(_oriented("up", ul, ur))),        # left→right
         "down": _feat(LineString(_oriented("down", dl, dr))),    # left→right
     }
+
+
+def corner_gaps_m(up, left, right, down) -> Optional[float]:
+    """Approximate MAX shared-corner endpoint gap in metres across the four boundary sides, or None
+    if a side is missing. Corner-matching mirrors ``assemble_domain_from_sides`` (closest endpoint
+    pair between two adjacent sides). Uses a local equirectangular scale (good enough to decide
+    whether the user's lines actually meet); a large value means the domain doesn't cleanly close."""
+    coords = {}
+    for k, f in (("up", up), ("left", left), ("right", right), ("down", down)):
+        c = _coords_of(f) if f else []
+        if len(c) < 2:
+            return None
+        coords[k] = c
+    lat0 = coords["up"][0][1]
+    kx = 111320.0 * cos(radians(lat0))       # metres per degree lon at this latitude
+    ky = 110540.0                            # metres per degree lat
+    def _ends(k):
+        return (coords[k][0], coords[k][-1])
+    def _gap(a_ends, b_ends):
+        return min(hypot((pa[0] - pb[0]) * kx, (pa[1] - pb[1]) * ky)
+                   for pa in a_ends for pb in b_ends)
+    return max(_gap(_ends("up"), _ends("left")), _gap(_ends("up"), _ends("right")),
+               _gap(_ends("down"), _ends("left")), _gap(_ends("down"), _ends("right")))
