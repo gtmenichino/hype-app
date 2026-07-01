@@ -21,9 +21,12 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 
 .hype-shell { position: absolute; inset: 0; overflow: hidden; }
 
-/* map fills everything BELOW the header so leaflet's controls never land on the header */
+/* map fills everything BELOW the header so leaflet's controls never land on the header.
+   :not(.hype-edit-bar) is critical — the floating edit bar is also a direct <div> child of
+   .hype-map-wrap, and without the exclusion this rule stretched it to 100%×100%, turning its
+   near-opaque white background into a sheet that covered the whole map in boundary edit mode. */
 .hype-map-wrap { position: absolute; top: var(--hype-header-h); left: 0; right: 0; bottom: 0; z-index: 0; }
-.hype-map-wrap > div,
+.hype-map-wrap > div:not(.hype-edit-bar),
 .hype-map-wrap .shiny-html-output,
 .hype-map-wrap .jupyter-widgets { height: 100% !important; width: 100% !important; }
 .hype-map-wrap .leaflet-container { height: 100% !important; width: 100% !important; }
