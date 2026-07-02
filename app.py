@@ -17,6 +17,7 @@ import queue as _queue
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -37,7 +38,8 @@ import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
 from hype_app import (bieger, bundle, delineate, dem, estimate, geocode, geometry, hydro,  # noqa: E402
-                      mesh, results)
+                      mesh, ras_results, results)
+from hype_app import ras as ras_engine  # noqa: E402
 from hype_app import run as runner  # noqa: E402
 
 try:
@@ -70,10 +72,11 @@ NHD_STYLE = {"color": "#00c2ff", "weight": 3.5, "opacity": 0.95}     # clickable
 REACH_STYLE = {"color": "#ff2d95", "weight": 5, "opacity": 0.95}     # the analysis reach (magenta — pops on USGS topo, distinct from cyan NHD)
 CAP_STYLE = {"color": "#333333", "weight": 2, "opacity": 0.9, "dashArray": "6 5", "fill": False}
 
-STEP_REACH, STEP_DEM, STEP_BOUNDARIES, STEP_K, STEP_MESH, STEP_RUN, STEP_RESULTS = (
-    "reach", "dem", "boundaries", "k", "mesh", "run", "results")
+STEP_REACH, STEP_DEM, STEP_BOUNDARIES, STEP_SURFACE, STEP_K, STEP_MESH, STEP_RUN, STEP_RESULTS = (
+    "reach", "dem", "boundaries", "surface", "k", "mesh", "run", "results")
 STEP_LABELS = [(STEP_REACH, "Reach"), (STEP_DEM, "DEM"), (STEP_BOUNDARIES, "Boundaries"),
-               (STEP_K, "K"), (STEP_MESH, "Mesh"), (STEP_RUN, "Run"), (STEP_RESULTS, "Results")]
+               (STEP_SURFACE, "Surface"), (STEP_K, "K"), (STEP_MESH, "Mesh"),
+               (STEP_RUN, "Run"), (STEP_RESULTS, "Results")]
 # Steps where the user draws/edits shapes in the DrawControl (vs. static mirrored layers).
 EDIT_STEPS = (STEP_REACH, STEP_BOUNDARIES, STEP_K)
 
@@ -111,6 +114,7 @@ app_ui = ui.page_fillable(
         ui.tags.link(rel="stylesheet", href=_asset("styles.css")),
         ui.tags.script(src=_asset("geocode.js")),
         ui.tags.script(src=_asset("reach_draw.js")),
+        ui.tags.script(src=_asset("map_bounds.js")),  # reports the live view bounds to Shiny
         ui.tags.script(src=_asset("mesh3d.js")),     # lazy-loads vtk.js from a CDN on first Compute
     ),
     ui.div(
@@ -164,7 +168,9 @@ def server(input, output, session):
     mesh_geom = reactive.value(None)       # last computed 3D mesh geometry (for status + viewer)
     kzone_feats = reactive.value([])       # list of GeoJSON polygon features (4326)
     wse_extent_feat = reactive.value(None)  # drawn water-surface (wetted) extent polygon (4326)
-    wse_mode_v = reactive.value("draw")     # mirror of the WSE-mode radio; persists across steps
+    wse_mode_v = reactive.value("model")    # mirror of the WSE-mode radio; persists across steps
+    #                                         (model-first: the HEC-RAS surface run is the default
+    #                                          water surface; draw/upload are the fallbacks)
     delineate_mode = reactive.value("auto")  # "auto" (pick 2 NHD points) | "manual" (draw)
     pick_pts = reactive.value([])           # snapped points: [{lat,lon,comid,dist_ft}, ...]
     reach_feat = reactive.value(None)       # traced reach LineString Feature (4326)
@@ -175,6 +181,11 @@ def server(input, output, session):
     proj_crs = reactive.value(None)
     dem_path = reactive.value(None)
     dem_meta = reactive.value(None)        # {"resolution_m", "source"} of the fetched 3DEP DEM
+    dem_hs_v = reactive.value(2.0)         # hillshade strength (vertical exaggeration; 0 = flat tint)
+    dem_opacity_v = reactive.value(0.8)    # DEM overlay opacity while on the DEM step
+    dem_stretch_v = reactive.value(None)   # (vmin, vmax) color stretch, or None = full-raster 2-98%
+    dem_lohi_v = reactive.value(None)      # effective (vmin, vmax) of the rendered overlay (legend)
+    _dem_shade_sig: dict = {}              # last-rendered (path, hs, stretch) — skip no-op renders
     run_result = reactive.value(None)
     head_tifs = reactive.value([])          # per-layer head GeoTIFF paths (index 0 = top layer)
     head_rng = reactive.value(None)         # global (vmin, vmax) for consistent head coloring
@@ -189,6 +200,35 @@ def server(input, output, session):
     elapsed_v = reactive.value(0)          # seconds elapsed (updated by the poller)
     step_v = reactive.value(0)             # current STEP number parsed from the log
     _proc: dict = {"p": None}              # handle to the running child process (for cancel)
+    # ---- surface-water (HEC-RAS 2025) model state ----
+    ras_result = reactive.value(None)      # dict from ras_engine.run_surface_model (or None)
+    ras_log_lines: list[str] = []
+    ras_log_tick = reactive.value(0)
+    ras_t0 = reactive.value(0.0)
+    ras_elapsed = reactive.value(0)
+    _ras_proc: dict = {"proc": None}       # live RAS CLI subprocess (for cancel)
+    _ras_cancel = threading.Event()
+    # Live progress: the worker thread writes this dict (scalar writes, GIL-safe); the
+    # 0.5 s poller copies it into the reactives so the UI never touches worker state.
+    _ras_prog: dict = {"stage": "", "pct": None, "stage_t0": 0.0}
+    ras_stage = reactive.value("")
+    ras_pct = reactive.value(None)         # 0-100 within the current stage, or None
+    ras_stage_t0 = reactive.value(0.0)     # monotonic start of the current stage (for ETA)
+    ras_mesh_prev = reactive.value(None)   # dict from ras_engine.build_mesh_preview (or None)
+    _mesh_proc: dict = {"proc": None}      # RAS mesh-preview subprocess (independent of the run)
+    _mesh3d_proc: dict = {"p": None}       # 3-D grid-preview child process (Mesh step; cancellable)
+    _ras_overlays: dict = {}               # "depth"/"wse" -> ImageOverlay payloads (big data URIs)
+    ras_view_v = reactive.value("depth")   # result overlay shown: "depth" | "wse" | "hide"
+    ras_opacity_v = reactive.value(0.7)
+
+    def _on_ras_progress(stage: str, pct):
+        # Called from the RAS worker thread on every stage change / percent tick.
+        if stage != _ras_prog["stage"]:
+            _ras_prog["stage"] = stage
+            _ras_prog["stage_t0"] = time.monotonic()
+            _ras_prog["pct"] = None
+        if pct is not None:
+            _ras_prog["pct"] = pct
 
     def _terminate_child():
         p = _proc.get("p")
@@ -199,8 +239,24 @@ def server(input, output, session):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _kill_ras_proc():
+        _ras_cancel.set()
+        p = _ras_proc.get("proc")
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _on_session_end():
         _terminate_child()
+        _kill_ras_proc()
+        p = _mesh3d_proc.get("p")
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
         shutil.rmtree(work_dir, ignore_errors=True)
 
     session.on_ended(_on_session_end)
@@ -286,19 +342,39 @@ def server(input, output, session):
     @reactive.effect
     def _sync_wse_mode():
         # Mirror the WSE-mode radio into a reactive.value so the (non-reactive) draw callback and
-        # the run handler can read it. Only update while the input is mounted (Define step); when
-        # it unmounts on step change, keep the last value instead of clobbering it with a default.
+        # the run handler can read it. Ignore unset/None reads: while the radio remounts (leftpane
+        # re-render or step change) the input transiently reads None — writing that through would
+        # clobber the persisted mode back to the "draw" default and snap the radio back.
         try:
-            wse_mode_v.set(input.wse_mode())
+            v = input.wse_mode()
         except Exception:  # noqa: BLE001
-            pass
+            return
+        if v:
+            wse_mode_v.set(v)
+
+    @reactive.effect
+    def _push_wse_mode_to_radio():
+        # Reverse sync: when the SERVER changes the mode (a completed surface run switches to
+        # "model"; regen / stale-invalidation falls back to "draw"), patch the mounted radio in
+        # place. update_radio_buttons does not remount the input, so this cannot re-enter the
+        # clobber loop the pane-re-render approach had (leftpane reads the mode isolated).
+        v = wse_mode_v()
+        with reactive.isolate():
+            try:
+                cur = input.wse_mode()
+            except Exception:  # noqa: BLE001
+                return
+        if v and cur and v != cur:
+            ui.update_radio_buttons("wse_mode", selected=v)
 
     @reactive.effect
     def _sync_delineate_mode():
         try:
-            delineate_mode.set(input.delineate_mode())
+            v = input.delineate_mode()
         except Exception:  # noqa: BLE001
-            pass
+            return
+        if v:
+            delineate_mode.set(v)
 
     def _fc(feat):
         return feat if (feat or {}).get("type") == "FeatureCollection" else {
@@ -315,26 +391,52 @@ def server(input, output, session):
         return {"up": up_feat, "left": left_feat, "right": right_feat, "down": down_feat,
                 "wse": wse_extent_feat}.get(slot)
 
+    _mirror_shown: dict = {}    # layer name -> id(feature) shown (identity guard, like _bnd_shown)
+
+    def _mirror_show(nm, feat, style):
+        """Idempotent mirror-layer set: skip untouched layers so a re-mirror (step change, WSE-mode
+        flip) never churns the whole layer list — bursts of remove+add are what make the ipyleaflet
+        client drop unrelated layers."""
+        sig = id(feat) if feat is not None else None
+        if _mirror_shown.get(nm, _MISSING) == sig:
+            return
+        _mirror_shown[nm] = sig
+        _set_layer(nm, GeoJSON(data=_fc(feat), style=style, name=nm) if feat is not None else None)
+
     def _mirror_features_as_layers():
-        """Show the geometry as named, toggleable, thin static layers (features read isolated)."""
+        """Show the geometry as named, toggleable, thin static layers (features read isolated).
+        The hand-drawn/auto WSE polygon is suppressed whenever the surface MODEL owns the water
+        surface — on the Surface step (whose own result layers replace it) and everywhere once
+        wse_mode is "model" — so a stale drawn extent can never masquerade as model output."""
+        model_owns_wse = wse_mode_v() == "model"     # subscribing read: mode flips re-mirror
         with reactive.isolate():
             dom, wse, lf, rf, uf, df, kz, rch = (
                 domain_feat(), wse_extent_feat(), left_feat(), right_feat(),
                 up_feat(), down_feat(), list(kzone_feats()), reach_feat())
+            if model_owns_wse or current_step() == STEP_SURFACE:
+                wse = None
         for nm, feat, style in (("Domain", dom, DOMAIN_STYLE),
                                 ("Water-surface extent", wse, WSE_STYLE),
                                 ("Left boundary", lf, LEFT_STYLE), ("Right boundary", rf, RIGHT_STYLE),
                                 ("Upstream boundary", uf, UP_STYLE),
                                 ("Downstream boundary", df, DOWN_STYLE)):
-            _set_layer(nm, GeoJSON(data=_fc(feat), style=style, name=nm) if feat else None)
-        _set_layer("K-zones", GeoJSON(data={"type": "FeatureCollection", "features": kz},
-                                      style=KZONE_STYLE, name="K-zones") if kz else None)
-        _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
+            _mirror_show(nm, feat, style)
+        kz_fc = {"type": "FeatureCollection", "features": kz} if kz else None
+        if _mirror_shown.get("K-zones", _MISSING) != (tuple(id(f) for f in kz) or None):
+            _mirror_shown["K-zones"] = tuple(id(f) for f in kz) or None
+            _set_layer("K-zones", GeoJSON(data=kz_fc, style=KZONE_STYLE, name="K-zones")
+                       if kz_fc else None)
+        _mirror_show("Reach", rch, REACH_STYLE)
+        label_sig = (id(uf), id(lf), id(rf), id(df), id(wse) if wse else None)
+        if _mirror_shown.get("Boundary labels", _MISSING) != label_sig:
+            _mirror_shown["Boundary labels"] = label_sig
+            _render_boundary_labels({"up": uf, "left": lf, "right": rf, "down": df}, wse)
 
     def _clear_mirror_layers():
         for nm in _MIRROR_NAMES:
             _set_layer(nm, None)
         _bnd_shown.clear()
+        _mirror_shown.clear()
 
     def _bnd_show(nm, feat, style):
         # Idempotent layer set for the Boundaries step: only rebuild `nm` when the shown feature
@@ -392,9 +494,12 @@ def server(input, output, session):
         line moving in/out of the DrawControl) — never a full clear + re-add. The derived-domain gold
         ring is intentionally NOT drawn here: the four coloured sides already trace the domain, and
         drawing it on top masked their distinct legend colours (worse after edits re-stacked it)."""
+        model_owns_wse = wse_mode_v() == "model"     # subscribing read: mode flips re-render
         with reactive.isolate():
             feats = {"up": up_feat(), "left": left_feat(), "right": right_feat(), "down": down_feat()}
             wse = wse_extent_feat(); rch = reach_feat()
+            if model_owns_wse:                # the RAS model owns the water surface now
+                wse = None
         for slot, (nm, style) in _BND_STATIC.items():
             _bnd_show(nm, feats[slot] if slot != active else None, style)
         _bnd_show("Domain", None, DOMAIN_STYLE)   # clear any domain ring carried in from another step
@@ -402,6 +507,7 @@ def server(input, output, session):
         _bnd_show("Reach", rch, REACH_STYLE)
         _bnd_show("K-zones", None, KZONE_STYLE)
         _render_boundary_labels(feats, wse)
+        _mirror_shown.clear()      # labels/layers now owned by the Boundaries renderer; re-mirror fresh
 
     @reactive.effect
     def _sync_map_shapes():
@@ -423,6 +529,14 @@ def server(input, output, session):
         elif step == STEP_K:
             _clear_mirror_layers()
             _set_layer("Reach", GeoJSON(data=rch, style=REACH_STYLE, name="Reach") if rch else None)
+            # keep the four boundary lines (+ labels) visible for orientation while the
+            # K-zones themselves live in the DrawControl for editing
+            with reactive.isolate():
+                feats = {"up": up_feat(), "left": left_feat(),
+                         "right": right_feat(), "down": down_feat()}
+            for slot, (nm, style) in _BND_STATIC.items():
+                _mirror_show(nm, feats[slot], style)
+            _render_boundary_labels(feats, None)
             _load_into_drawcontrol(kz)
         elif step == STEP_BOUNDARIES:
             pass                                   # _sync_bnd_slot owns the Boundaries display
@@ -436,18 +550,93 @@ def server(input, output, session):
 
     @reactive.effect
     def _dem_backdrop_by_step():
-        # The DEM hillshade (light terrain colormap, opacity 0.8) is a DEM-tab backdrop only. Off the
-        # DEM step it washes the basemap pale and — stacking above the early-added DrawControl —
-        # buries the boundary line you select to edit. Hide it everywhere except DEM (live opacity
-        # trait, same as the head overlay; no rebuild, and opacity 0 also neutralizes the z-order).
+        # The DEM hillshade is a DEM-tab backdrop only. Off the DEM step it washes the basemap
+        # pale and — stacking above the early-added DrawControl — buries the boundary line you
+        # select to edit. Hide it everywhere except DEM (live opacity trait, same as the head
+        # overlay; no rebuild, and opacity 0 also neutralizes the z-order). On the DEM step the
+        # opacity comes from the user's slider (dem_opacity_v — subscribing read, so drags apply
+        # live without re-rendering the image).
         step = current_step()          # read FIRST so the effect subscribes even before the DEM
+        opacity = float(dem_opacity_v())
         lyr = _layers.get("dem")       # overlay exists (else the early return skips the dependency
         if lyr is None:                # and it never re-runs when the hillshade later appears).
             return
         try:
-            lyr.opacity = 0.8 if step == STEP_DEM else 0.0
+            lyr.opacity = opacity if step == STEP_DEM else 0.0
         except Exception:  # noqa: BLE001
             pass
+
+    @reactive.effect
+    def _dem_shade_sync():
+        # Re-render the DEM hillshade image when its LOOK changes (hillshade strength slider or
+        # a recalculated color stretch) — mutating the existing overlay's url trait, never
+        # remove+add (the ipyleaflet churn lesson). Signature-guarded so fetch-time creation
+        # doesn't trigger a duplicate identical render.
+        p = dem_path()
+        hs = float(dem_hs_v())
+        stretch = dem_stretch_v()
+        if not (_HAS_MAP and p):
+            return
+        lyr = _layers.get("dem")
+        if lyr is None:
+            return
+        sig = (p, hs, stretch)
+        if _dem_shade_sig.get("sig") == sig:
+            return
+        _dem_shade_sig["sig"] = sig
+        try:
+            vmin, vmax = (stretch if stretch else (None, None))
+            ov = dem.dem_overlay(p, vert_exag=hs, vmin=vmin, vmax=vmax)
+            lyr.url = ov["url"]
+            dem_lohi_v.set((ov["vmin"], ov["vmax"]))
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"DEM render issue: {e}", type="warning", duration=5)
+
+    @reactive.effect
+    @reactive.event(input.dem_stretch_btn)
+    def _dem_stretch_from_view():
+        # "Recalculate legend based on current view": re-stretch the elevation colors to the
+        # terrain visible in the map viewport (classic GIS stretch-to-extent) so subtle relief
+        # pops when zoomed into a subarea. Zooming back out + clicking again widens it back.
+        p = dem_path()
+        if not (p and _HAS_MAP):
+            return
+        # View bounds come from www/map_bounds.js (input.map_bounds) — ipyleaflet's own
+        # `bounds` trait arrives degenerate ((center, center)) in this stack.
+        try:
+            b = input.map_bounds()
+        except Exception:  # noqa: BLE001
+            b = None
+        if not b or b.get("east") is None or b["east"] <= b["west"]:
+            ui.notification_show("Pan or zoom the map once, then try again.", duration=4)
+            return
+        lohi = dem.stretch_for_bounds(
+            p, (float(b["west"]), float(b["south"]), float(b["east"]), float(b["north"])))
+        if lohi is None:
+            ui.notification_show("No terrain in the current view — pan to the DEM first.",
+                                 type="warning", duration=5)
+            return
+        dem_stretch_v.set(lohi)
+        ui.notification_show(f"Legend re-stretched to the view: {lohi[0]:.1f}–{lohi[1]:.1f} m.",
+                             duration=4)
+
+    @reactive.effect
+    def _mirror_dem_hs():
+        try:
+            v = input.dem_hs()
+        except Exception:  # noqa: BLE001
+            return
+        if v is not None:
+            dem_hs_v.set(float(v))
+
+    @reactive.effect
+    def _mirror_dem_opacity():
+        try:
+            v = input.dem_opacity()
+        except Exception:  # noqa: BLE001
+            return
+        if v is not None:
+            dem_opacity_v.set(float(v))
 
     @reactive.effect
     def _sync_bnd_slot():
@@ -647,7 +836,7 @@ def server(input, output, session):
             dc.on_draw(_on_draw)
             m.add(dc)
             m.add(LayersControl(position="topright"))
-            m.add(ScaleControl(position="bottomleft"))
+            m.add(ScaleControl(position="bottomright"))   # bottom-left is the zoom/CRS chip
 
             def _on_interaction(**kw):     # capture map clicks for upstream/downstream picking
                 if kw.get("type") == "click":
@@ -749,11 +938,16 @@ def server(input, output, session):
             return
         dem_path.set(res["path"])
         dem_meta.set({"resolution_m": res.get("resolution_m"), "source": res.get("source")})
+        dem_stretch_v.set(None)            # a fresh DEM starts at the full-raster stretch
         if _HAS_MAP:                       # hillshade backdrop
             try:
-                ov = dem.dem_overlay(res["path"])
+                with reactive.isolate():
+                    hs = float(dem_hs_v()); op = float(dem_opacity_v())
+                ov = dem.dem_overlay(res["path"], vert_exag=hs)
                 _set_layer("dem", ImageOverlay(url=ov["url"], bounds=ov["bounds"],
-                                               name="DEM (hillshade)", opacity=0.8))
+                                               name="DEM (hillshade)", opacity=op))
+                _dem_shade_sig["sig"] = (res["path"], hs, None)   # skip the duplicate re-render
+                dem_lohi_v.set((ov["vmin"], ov["vmax"]))
             except Exception as e:  # noqa: BLE001
                 ui.notification_show(f"DEM loaded; overlay render issue: {e}", duration=5)
         # Terrain only — boundary delineation happens on the Boundaries tab ("Generate boundaries").
@@ -841,7 +1035,7 @@ def server(input, output, session):
                 _flow["gdf"] = gpd.GeoDataFrame.from_features(gj["features"], crs=4326)
             except Exception:  # noqa: BLE001
                 _flow["gdf"] = None
-            nhd_status.set(f"✓ {n} streams — click the upstream + downstream points.")
+            nhd_status.set("")     # streams are visible on the map — no status line needed
         else:
             nhd_status.set("No streams here — pan to a stream, or draw manually.")
 
@@ -929,8 +1123,7 @@ def server(input, output, session):
         for w in r.get("warnings", []):
             ui.notification_show(w, duration=5)
         ui.notification_show(f"Reach {r['length_m']/1609.344:.2f} mi · drainage area "
-                             f"{r['da_sqkm']:.1f} km² · bankfull depth {bf['depth_m']:.2f} m "
-                             f"({bf['division_name']}). Fetching terrain…", duration=7)
+                             f"{r['da_sqkm']:.1f} km². Fetching terrain…", duration=7)
 
     @reactive.extended_task
     async def delineate_task(reach, dem_p, da, lat, lon, x_mult) -> dict:
@@ -958,17 +1151,23 @@ def server(input, output, session):
         # editable boundaries, not static caps.
         up_feat.set(d.get("up_cap")); left_feat.set(d["left"])
         right_feat.set(d["right"]); down_feat.set(d.get("down_cap"))
-        wse_extent_feat.set(d["wse_extent"]); wse_mode_v.set("draw")
+        wse_extent_feat.set(d["wse_extent"])   # fallback extent only; the WSE mode stays as chosen
+        #                                        (model-first default — don't clobber it to "draw")
+        # Imperative map pushes below run ISOLATED: _render_boundaries /
+        # _mirror_features_as_layers deliberately take a subscribing wse_mode_v read for
+        # their OWNER effects — inherited here it would re-run this whole handler on a
+        # WSE-mode radio flip, re-setting the features and clobbering the mode back to
+        # "draw" (and wiping any boundary edits with stale delineation output).
         with reactive.isolate():
             on_boundaries = current_step() == STEP_BOUNDARIES
             bnd_slot.set(None)                 # deselect; nothing armed until a boundary button is clicked
-        if on_boundaries:
-            _load_into_drawcontrol([])
-            _render_boundaries(None)
-        else:                                  # generated before reaching Boundaries → show statics
-            _mirror_features_as_layers()
-        if _HAS_MAP:
-            _fit_domain()                      # frame the fresh domain clear of the left panel
+            if on_boundaries:
+                _load_into_drawcontrol([])
+                _render_boundaries(None)
+            else:                              # generated before reaching Boundaries → show statics
+                _mirror_features_as_layers()
+            if _HAS_MAP:
+                _fit_domain()                  # frame the fresh domain clear of the left panel
         ui.notification_show("Domain, boundaries & wetted extent generated — open the Boundaries tab "
                              "to review/edit each boundary.", duration=8)
 
@@ -1021,11 +1220,50 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             return None
 
-    # ---- 3D mesh preview (server builds geometry in pure numpy → vtk.js renders client-side) ----
+    # ---- 3D mesh preview (server builds geometry in pure numpy → vtk.js renders client-side).
+    # The build runs in a SPAWNED CHILD PROCESS: the engine discretization allocates full-grid
+    # arrays, and an over-fine cell size used to OOM-kill the whole app — now the child dies
+    # alone, and Cancel can hard-kill it mid-build. ----
     @reactive.extended_task
-    async def mesh_task(domain_f, dem_p, crs, cell_size, depth, z) -> dict:
-        return await anyio.to_thread.run_sync(
-            lambda: mesh.build_grid_geometry(domain_f, dem_p, crs, cell_size, depth, z))
+    async def mesh_task(payload: dict) -> dict:
+        def _work():
+            ctx = mp.get_context("spawn")
+            q = ctx.Queue()
+            p = ctx.Process(target=mesh.child_build, args=(payload, q), daemon=True)
+            _mesh3d_proc["p"] = p
+            p.start()
+            result = error = None
+            while True:
+                try:
+                    kind, data = q.get(timeout=0.3)
+                    if kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    if not p.is_alive():
+                        break
+            while True:                       # drain whatever was queued right before exit
+                try:
+                    kind, data = q.get_nowait()
+                    if kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    break
+            p.join(timeout=5)
+            cancelled = _mesh3d_proc.pop("cancelled", False)
+            _mesh3d_proc["p"] = None
+            if cancelled:
+                return {"cancelled": True}
+            if error is not None:
+                return {"error": error}
+            if result is None:
+                return {"error": "The mesh build stopped unexpectedly (likely out of memory). "
+                                 "Try a coarser cell size."}
+            return result
+        return await anyio.to_thread.run_sync(_work)
 
     @reactive.effect
     @reactive.event(input.compute_mesh)
@@ -1035,9 +1273,31 @@ def server(input, output, session):
             ui.notification_show("Need the four boundaries and terrain first.",
                                  type="warning", duration=5)
             return
+        est = grid_estimate()                 # same red band that blocks Run — refuse up front
+        if est and estimate.band(est["n_cells"]) == "red":
+            ui.notification_show(estimate.band_message(est), type="error", duration=10)
+            return
         stage.set("Building the 3D mesh…")
-        mesh_task(build["domain"], dem_path(), proj_crs(), float(_safe("cell_size", 10.0)),
-                  float(_safe("gw_mod_depth", 6.0)), float(_safe("z", 0.25)))
+        mesh_task({
+            "domain": build["domain"],
+            "sides": {k: build[k] for k in ("up", "left", "right", "down")},
+            "dem": dem_path(), "crs": proj_crs().to_wkt(),
+            "cell_size": float(_safe("cell_size", 10.0)),
+            "depth": float(_safe("gw_mod_depth", 6.0)), "z": float(_safe("z", 0.25)),
+        })
+
+    @reactive.effect
+    def _cancel_mesh3d():
+        if not _clicked_dynamic("mesh3d_cancel"):
+            return
+        p = _mesh3d_proc.get("p")
+        if p is not None:
+            _mesh3d_proc["cancelled"] = True
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        ui.notification_show("Mesh preview cancelled.", duration=3)
 
     @reactive.effect
     async def _mesh_done():
@@ -1054,12 +1314,21 @@ def server(input, output, session):
             g = mesh_task.result()
         except Exception:  # noqa: BLE001
             return
+        if g.get("cancelled"):
+            return
+        if g.get("error"):
+            ui.notification_show(f"Mesh build failed: {g['error']}", type="error", duration=10)
+            return
         mesh_geom.set(g)
         await session.send_custom_message("hype_mesh", g)
 
     def _wse_path():
-        """Resolve the WSE raster the engine will use: the uploaded raster, or the DEM clipped
-        to the drawn wetted-extent polygon. Returns None if neither is available yet."""
+        """Resolve the WSE raster the engine will use: the surface-model result, the uploaded
+        raster, or the DEM clipped to the drawn wetted-extent polygon. None if unavailable."""
+        if wse_mode_v() == "model":
+            res = ras_result()
+            p = (res or {}).get("wse_for_gw")
+            return p if p and Path(p).exists() else None
         if wse_mode_v() == "upload":
             up = _safe("wse_upload", None)
             if not up:
@@ -1074,6 +1343,340 @@ def server(input, output, session):
         out = work_dir / "inputs" / "wse_extent.tif"
         out.parent.mkdir(parents=True, exist_ok=True)
         return dem.clip_dem_to_polygon(dem_path(), geometry.single_feature_gdf(feat), str(out))
+
+    # ---- surface-water model (HEC-RAS 2025, in a worker thread; the solver is a subprocess) ----
+    CFS_TO_CMS = 0.028316846592
+
+    @reactive.calc
+    def ras_slope_default():
+        """DEM-derived prefill for the Normal Depth friction slope (None until derivable)."""
+        build = _domain_build()
+        if not (build and dem_path()):
+            return None
+        return ras_engine.default_friction_slope(dem_path(), build["up"], build["down"])
+
+    @reactive.extended_task
+    async def ras_task(payload: dict) -> dict:
+        def _work():
+            return ras_engine.run_surface_model_safe(
+                payload, log=ras_log_lines.append,
+                cancel_evt=_ras_cancel, proc_holder=_ras_proc,
+                progress=_on_ras_progress)
+        return await anyio.to_thread.run_sync(_work)
+
+    @reactive.extended_task
+    async def mesh_prev_task(payload: dict) -> dict:
+        def _work():
+            return ras_engine.build_mesh_preview_safe(
+                payload, log=ras_log_lines.append, proc_holder=_mesh_proc)
+        return await anyio.to_thread.run_sync(_work)
+
+    def _clicked_dynamic(bid: str) -> bool:
+        """Strict-increment click guard for action buttons living inside re-rendered output_ui
+        containers (their counts reset to 0 on each re-render; @reactive.event would misfire —
+        the shared-go_next footgun, see _continue_nav)."""
+        try:
+            n = int(input[bid]() or 0)
+        except Exception:  # noqa: BLE001
+            n = 0
+        last = _nav_seen.get(bid, 0)
+        if n != last:
+            _nav_seen[bid] = n
+            return n > last
+        return False
+
+    @reactive.effect
+    def _start_surface():
+        if not _clicked_dynamic("run_surface"):
+            return
+        build = _domain_build()
+        if not (build and dem_path()):
+            ui.notification_show("Need all four boundaries (closing into a domain) plus terrain "
+                                 "before running the surface model.", type="warning", duration=6)
+            return
+        if not ras_engine.ras_available():
+            ui.notification_show("The HEC-RAS 2025 engine isn't available in this deployment "
+                                 "(bin/ras2025 missing and HYPE_RAS_BIN not set).",
+                                 type="error", duration=8)
+            return
+        cell = float(_safe("ras_cell", 10.0))
+        est = ras_engine.estimate_cell_count(_domain_gdf_4326(), cell)
+        _green, cap = ras_engine.cell_budget()
+        if est > cap:
+            need = cell * (est / cap) ** 0.5
+            ui.notification_show(f"~{est:,} cells at {cell:g} m — over the {cap:,} limit. "
+                                 f"Increase the cell size to ~{need:.0f} m.",
+                                 type="error", duration=10)
+            return
+        slope = float(_safe("ras_slope", 0.0) or 0.0)
+        if slope <= 0:
+            slope = ras_slope_default() or 0.001
+        payload = {
+            "up": build["up"], "left": build["left"], "right": build["right"],
+            "down": build["down"], "domain": build["domain"], "dem": dem_path(),
+            "flow_cms": float(_safe("ras_flow", 100.0)) * CFS_TO_CMS,
+            "friction_slope": slope,
+            "manning_n": float(_safe("ras_n", 0.06)),
+            "cell_size_m": cell,
+            "duration_hr": float(_safe("ras_hours", 6.0)),
+            "timestep_s": float(_safe("ras_dt", 10.0)),
+            "output_interval_s": max(60.0, float(_safe("ras_out_min", 15.0)) * 60.0),
+            "work_dir": str(work_dir),
+        }
+        ras_log_lines.clear()
+        ras_log_tick.set(0)
+        _ras_cancel.clear()
+        _ras_prog.update(stage="Starting", pct=None, stage_t0=time.monotonic())
+        ras_stage.set("Starting"); ras_pct.set(None)
+        ras_t0.set(time.monotonic())
+        ras_elapsed.set(0)
+        ras_task(payload)
+
+    @reactive.effect
+    def _ras_poll():
+        if ras_task.status() != "running":
+            return
+        reactive.invalidate_later(0.5)
+        ras_log_tick.set(len(ras_log_lines))
+        ras_elapsed.set(int(time.monotonic() - ras_t0()))
+        ras_stage.set(_ras_prog["stage"])
+        ras_pct.set(_ras_prog["pct"])
+        ras_stage_t0.set(_ras_prog["stage_t0"])
+
+    @reactive.effect
+    def _ras_done():
+        status = ras_task.status()
+        if status in ("initial", "running"):
+            return
+        if status == "cancelled":
+            return
+        try:
+            res = ras_task.result()
+        except Exception as e:  # noqa: BLE001
+            res = {"error": str(e)}
+        ras_log_tick.set(len(ras_log_lines))
+        if "error" in res:
+            if not _ras_cancel.is_set():
+                ui.notification_show("Surface model failed — see the log on the Surface step.",
+                                     type="error", duration=8)
+                ras_log_lines.append("FAILED: " + res["error"])
+                ras_log_tick.set(len(ras_log_lines))
+            return
+        _ras_overlays.clear()
+        try:
+            _ras_overlays["depth"] = ras_results.result_overlay(res["depth_tif"], "depth")
+            _ras_overlays["wse"] = ras_results.result_overlay(res["wse_tif"], "wse")
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Surface model done; raster render issue: {e}", duration=6)
+        ras_view_v.set("depth")
+        ras_result.set(res)                         # _ras_view_sync draws extent + result raster
+        wse_mode_v.set("model")                     # the modeled WSE now feeds the groundwater run
+        ui.notification_show("Surface model complete — the modeled water surface will be used "
+                             "as the groundwater top boundary.", duration=6)
+
+    _upsert_sig: dict = {}      # layer name -> id(feature) currently shown (change guard)
+
+    def _upsert_image(key, ov, opacity):
+        """Set/refresh an ImageOverlay, mutating the EXISTING widget's traits when possible and
+        doing NOTHING when nothing changed. Remove+add churn — and even a same-value trait
+        resync — makes the ipyleaflet client rebuild layers, and rebuilds racing inside a bursty
+        flush is how layers got dropped (observed: mesh + extent lost at run completion / step
+        change)."""
+        old = _layers.get(key)
+        if ov is None:
+            if old is not None:
+                _set_layer(key, None)
+            return
+        if old is not None and isinstance(old, ImageOverlay):
+            try:
+                if old.url is ov["url"] and abs(float(old.opacity) - opacity) < 1e-9:
+                    return                       # unchanged — leave the client alone
+                if old.url is not ov["url"]:
+                    old.url = ov["url"]
+                    old.bounds = ov["bounds"]
+                old.opacity = opacity
+                return
+            except Exception:  # noqa: BLE001 — fall through to a clean re-add
+                pass
+        _set_layer(key, ImageOverlay(url=ov["url"], bounds=ov["bounds"], name=key,
+                                     opacity=opacity))
+
+    def _upsert_geojson(key, feat, style):
+        """GeoJSON flavor of _upsert_image: identity-guarded, mutate .data only on real change."""
+        old = _layers.get(key)
+        if feat is None:
+            if old is not None:
+                _set_layer(key, None)
+                _upsert_sig.pop(key, None)
+            return
+        if old is not None and isinstance(old, GeoJSON):
+            if _upsert_sig.get(key) == id(feat):
+                return                           # unchanged — leave the client alone
+            try:
+                old.data = _fc(feat)
+                _upsert_sig[key] = id(feat)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        _set_layer(key, GeoJSON(data=_fc(feat), style=style, name=key))
+        _upsert_sig[key] = id(feat)
+
+    _extent_state: dict = {"step": None, "fid": None}
+
+    @reactive.effect
+    def _ras_view_sync():
+        # Owns the surface-model result layers: the "Modeled extent" polygon (persists on every
+        # step while a result exists — it's the water surface the groundwater run consumes) and
+        # the "Surface result" raster (Surface step only; which raster + opacity from the pane
+        # controls). The extent is force re-added FRESH on each step change: step entries churn
+        # the layer list (clear+mirror bursts) and the ipyleaflet client can drop an untouched
+        # layer mid-burst — a new widget added after the churn (this effect runs last) sticks.
+        if not _HAS_MAP:
+            return
+        res = ras_result()
+        view = ras_view_v()
+        opacity = float(ras_opacity_v())
+        step = current_step()
+        ext = (res or {}).get("extent_feat")
+        if ext is None:
+            _upsert_geojson("Modeled extent", None, WSE_STYLE)
+            _extent_state.update(step=step, fid=None)
+        elif _extent_state.get("step") != step or _extent_state.get("fid") != id(ext):
+            _set_layer("Modeled extent", None)
+            _set_layer("Modeled extent",
+                       GeoJSON(data=_fc(ext), style=WSE_STYLE, name="Modeled extent"))
+            _upsert_sig["Modeled extent"] = id(ext)
+            _extent_state.update(step=step, fid=id(ext))
+        ov = _ras_overlays.get(view) if res else None
+        show = step == STEP_SURFACE and res is not None and view in ("depth", "wse") and ov
+        _upsert_image("Surface result", ov if show else None, opacity)
+
+    @reactive.effect
+    def _ras_mesh_sync():
+        # Owns the "RAS mesh" overlay (Surface step only). Rasterized PNG, not vector —
+        # thousands of face edges as SVG paths make Leaflet unusably slow. Also re-asserts
+        # after a run completes (ras_result read) — the completion flush is exactly when the
+        # client historically lost this layer.
+        if not _HAS_MAP:
+            return
+        prev = ras_mesh_prev()
+        ras_result()                               # re-run on run completion (see docstring)
+        ov = (prev or {}).get("overlay")
+        show = current_step() == STEP_SURFACE and prev and not prev.get("too_big") and ov
+        _upsert_image("RAS mesh", ov if show else None, 0.9)
+
+    @reactive.effect
+    def _cancel_surface():
+        if not _clicked_dynamic("cancel_surface"):
+            return
+        _kill_ras_proc()
+        ras_log_lines.append("[surface model cancelled by user]")
+        ras_log_tick.set(len(ras_log_lines))
+        try:
+            ras_task.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+        ui.notification_show("Surface model cancelled.", type="warning", duration=4)
+
+    @reactive.effect
+    def _start_mesh_preview():
+        if not _clicked_dynamic("ras_mesh_btn"):
+            return
+        build = _domain_build()
+        if not (build and dem_path()):
+            ui.notification_show("Need all four boundaries (closing into a domain) plus terrain "
+                                 "before meshing.", type="warning", duration=6)
+            return
+        if not ras_engine.ras_available():
+            ui.notification_show("The HEC-RAS 2025 engine isn't available in this deployment.",
+                                 type="error", duration=8)
+            return
+        mesh_prev_task({
+            "up": build["up"], "left": build["left"], "right": build["right"],
+            "down": build["down"], "domain": build["domain"], "dem": dem_path(),
+            "cell_size_m": float(_safe("ras_cell", 10.0)), "work_dir": str(work_dir),
+        })
+
+    @reactive.effect
+    def _mesh_preview_done():
+        status = mesh_prev_task.status()
+        if status in ("initial", "running", "cancelled"):
+            return
+        try:
+            res = mesh_prev_task.result()
+        except Exception as e:  # noqa: BLE001
+            res = {"error": str(e)}
+        ras_log_tick.set(len(ras_log_lines))
+        if "error" in res:
+            ui.notification_show("Meshing failed: " + res["error"][:300], type="error", duration=8)
+            return
+        ras_mesh_prev.set(res)                      # _ras_mesh_sync draws it
+        if res.get("too_big"):
+            ui.notification_show(f"Mesh built: {res['cell_count']:,} cells — too many faces "
+                                 f"({res['n_faces']:,}) to draw as an overlay; the run itself "
+                                 "is unaffected.", type="warning", duration=8)
+        else:
+            ui.notification_show(f"Mesh built: {res['cell_count']:,} cells at "
+                                 f"{res['cell_size_m']:g} m.", duration=5)
+
+    @reactive.effect
+    def _mirror_ras_view():
+        try:
+            v = input.ras_view()
+        except Exception:  # noqa: BLE001
+            return
+        if v:
+            ras_view_v.set(v)
+
+    @reactive.effect
+    def _mirror_ras_opacity():
+        try:
+            v = input.ras_opacity()
+        except Exception:  # noqa: BLE001
+            return
+        if v is not None:
+            ras_opacity_v.set(float(v))
+
+    @reactive.effect
+    def _mesh_preview_stale_on_cell():
+        # A mesh preview is only meaningful for the cell size it was built at.
+        try:
+            cell = float(input.ras_cell())
+        except Exception:  # noqa: BLE001
+            return
+        prev = ras_mesh_prev()
+        if prev and abs(float(prev.get("cell_size_m", cell)) - cell) > 1e-9:
+            ras_mesh_prev.set(None)
+
+    _ras_inputs_sig: dict = {}
+
+    def _drop_ras_artifacts():
+        """Clear every surface-model product (result, overlays, mesh preview + their layers)."""
+        ras_result.set(None)
+        ras_mesh_prev.set(None)
+        _ras_overlays.clear()
+        for nm in ("Modeled extent", "Surface result", "RAS mesh", "Water depth"):
+            _set_layer(nm, None)
+
+    @reactive.effect
+    def _ras_stale_on_edit():
+        # Boundary edits after a surface run make its extent/WSE stale — drop the result (and
+        # fall back to the drawn-extent mode) so the groundwater run can't consume mismatched
+        # water surfaces. Signature by feature identity: features are replaced, never mutated.
+        sig = tuple(id(f) for f in (up_feat(), left_feat(), right_feat(), down_feat()))
+        prev = _ras_inputs_sig.get("sig")
+        _ras_inputs_sig["sig"] = sig
+        if prev is None or sig == prev:
+            return
+        with reactive.isolate():
+            had_result = ras_result() is not None or ras_mesh_prev() is not None
+            if not had_result:
+                return
+        # The WSE mode deliberately stays "model" (model-first): the groundwater Run stays
+        # blocked with a clear message until the surface model is re-run on the new boundaries.
+        _drop_ras_artifacts()
+        ui.notification_show("Boundaries changed — the surface-model result was discarded; "
+                             "re-run it on the Surface step.", type="warning", duration=6)
 
     # ---- run (in a spawned child process so a Cancel can hard-kill MODFLOW) ----
     @reactive.extended_task
@@ -1130,8 +1733,8 @@ def server(input, output, session):
             return
         wse = _wse_path()
         if wse is None:
-            ui.notification_show("Draw the water-surface extent (or choose Upload and select a "
-                                 "WSE raster).", type="warning", duration=6)
+            ui.notification_show("No water surface yet — draw the wetted extent, run the Surface "
+                                 "model, or upload a WSE raster.", type="warning", duration=6)
             return
         try:
             crs = proj_crs()
@@ -1280,7 +1883,7 @@ def server(input, output, session):
         if dem_path() is not None:
             r.add(STEP_BOUNDARIES)
         if _domain_build() is not None:          # all four boundaries close into a valid domain
-            r.update({STEP_K, STEP_MESH})
+            r.update({STEP_SURFACE, STEP_K, STEP_MESH})
         if run_result() is not None:
             r.update({STEP_RUN, STEP_RESULTS})
         return r
@@ -1304,7 +1907,8 @@ def server(input, output, session):
         # footgun: @reactive.event fired on the 1→0 reset and tried to advance an extra step).
         reach = _reachable()
         for bid, tgt in (("next_reach", STEP_DEM), ("next_dem", STEP_BOUNDARIES),
-                         ("next_boundaries", STEP_K), ("next_k", STEP_MESH)):
+                         ("next_boundaries", STEP_SURFACE), ("next_surface", STEP_K),
+                         ("next_k", STEP_MESH)):
             try:
                 n = int(input[bid]() or 0)
             except Exception:  # noqa: BLE001
@@ -1483,6 +2087,7 @@ def server(input, output, session):
         up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
         wse_extent_feat.set(None); bnd_slot.set(None)
         dem_path.set(None); dem_meta.set(None)   # also drop the downloaded DEM + its overlay
+        dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
         _set_layer("dem", None)
         ui.notification_show("Cleared points, linework, and DEM — pick a new upstream and "
                              "downstream point.", duration=4)
@@ -1493,6 +2098,7 @@ def server(input, output, session):
         up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
         kzone_feats.set([]); wse_extent_feat.set(None); bnd_slot.set(None)
         dem_path.set(None); dem_meta.set(None)
+        dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
         _set_layer("dem", None)
         _clear_auto_picks()
         ui.notification_show("Cleared.", duration=3)
@@ -1503,7 +2109,10 @@ def server(input, output, session):
         up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
         kzone_feats.set([]); wse_extent_feat.set(None); bnd_slot.set(None)
         dem_path.set(None); dem_meta.set(None)
+        dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
         run_result.set(None); stage.set("")
+        _drop_ras_artifacts(); ras_log_lines.clear(); ras_log_tick.set(0)
+        wse_mode_v.set("model")
         head_tifs.set([]); head_rng.set(None); _head_cache.clear(); _contour_cache.clear()
         pick_pts.set([]); reach_feat.set(None); auto_meta.set(None); last_click.set(None)
         dc = _draw_ctl.get("dc")
@@ -1530,13 +2139,17 @@ def server(input, output, session):
                 "FPL, Right FPL, Downstream — floodplain = X × bankfull depth) + the wetted extent, "
                 "which close into the domain. Click a boundary to draw/edit it (double-click the line "
                 "to edit); set the boundary-condition gradients here.\n"
-                "4. **K** — horizontal/vertical conductivity & porosity; optionally draw K-zone "
+                "4. **Surface** *(optional)* — run a simplified **HEC-RAS 2025 2D** model (constant "
+                "flow upstream, normal depth downstream) to compute the wetted extent and water "
+                "surface instead of drawing them.\n"
+                "5. **K** — horizontal/vertical conductivity & porosity; optionally draw K-zone "
                 "polygons.\n"
-                "5. **Mesh** — cell size, model depth & layer thickness (a live estimate keeps the "
+                "6. **Mesh** — cell size, model depth & layer thickness (a live estimate keeps the "
                 "grid in bounds), then **Run model**.\n"
-                "6. **Run** → **Results**: pathlines + heads draw on the map; download the bundle.\n\n"
-                "The water-surface extent becomes the constant-head (CHD) top boundary, using the "
-                "DEM elevations inside it. Results live in temporary storage — **download before you leave**."),
+                "7. **Run** → **Results**: pathlines + heads draw on the map; download the bundle.\n\n"
+                "The water-surface extent becomes the constant-head (CHD) top boundary — from the "
+                "surface model's WSE when available, else the DEM elevations inside the drawn extent. "
+                "Results live in temporary storage — **download before you leave**."),
             title="Help", easy_close=True))
 
     # ---- downloads ----
@@ -1556,16 +2169,12 @@ def server(input, output, session):
                 ui.div(ui.input_action_button("find_address", "Find on map",
                                               class_="btn-sm btn-outline-secondary"),
                        class_="hype-actions"),
-                ui.div("Type to search — suggestions from OpenStreetMap / Photon.",
-                       class_="hype-ac-credit"),
                 ui.input_radio_buttons(
                     "delineate_mode", "Define the reach",
                     {"auto": "Auto — pick 2 points on a stream",
                      "manual": "Manual — draw the centerline"}, selected=delineate_mode()),
                 ui.panel_conditional(
                     "input.delineate_mode === 'auto'",
-                    ui.div("Zoom to your stream and pick the upstream + downstream points.",
-                           class_="hype-instr"),
                     ui.output_ui("nhd_status_ui"),
                     ui.output_ui("auto_readout"),
                     ui.div(ui.input_action_button("clear_points", "Clear",
@@ -1585,9 +2194,22 @@ def server(input, output, session):
                        class_="hype-actions"),
             )
         elif step == STEP_DEM:
+            display_ctrls = []
+            if dem_path() is not None:            # display controls only once terrain exists
+                with reactive.isolate():          # persisted slider state; changes must not
+                    hs0 = float(dem_hs_v())       # re-render this pane (remount footgun)
+                    op0 = float(dem_opacity_v())
+                display_ctrls = [
+                    ui.input_slider("dem_hs", "Hillshade strength (0 = flat colors)",
+                                    min=0.0, max=8.0, value=hs0, step=0.5),
+                    ui.input_slider("dem_opacity", "DEM opacity", min=0.0, max=1.0,
+                                    value=op0, step=0.05),
+                    ui.div(ui.input_action_button(
+                        "dem_stretch_btn", "Recalculate legend from view",
+                        class_="btn-sm btn-outline-secondary"), class_="hype-actions"),
+                    ui.output_ui("dem_legend"),
+                ]
             body = ui.TagList(
-                ui.div("Pick a resolution, then fetch 3DEP terrain over the reach.",
-                       class_="hype-instr"),
                 ui.input_select("dem_res", "DEM resolution",
                                 {"auto": "Auto — finest (1 m where available)", "1": "1 m",
                                  "3": "3 m", "5": "5 m", "10": "10 m"}, selected="auto"),
@@ -1595,13 +2217,14 @@ def server(input, output, session):
                        class_="hype-actions"),
                 ui.output_ui("busy"),
                 ui.output_ui("dem_status"),
+                *display_ctrls,
                 ui.div(ui.input_action_button("next_dem", "Continue → Boundaries",
                                               class_="btn-primary"), class_="hype-actions"),
             )
         elif step == STEP_BOUNDARIES:
-            body = ui.TagList(
-                ui.div("Generate the four boundaries from the reach, then click a boundary on the map "
-                       "to edit it — drag vertices, click midpoints to add.", class_="hype-instr"),
+            with reactive.isolate():          # persisted prefill only; a live (subscribing) read
+                wse_mode0 = wse_mode_v()      # here would re-render this whole pane on every radio
+            body = ui.TagList(                # change, remounting the radio mid-update
                 ui.input_select("fp_mult", "Floodplain extent = X × bankfull depth",
                                 {"2": "2×", "5": "5×", "10": "10× (default)"}, selected="10"),
                 ui.div(ui.input_action_button("regen", "Generate boundaries", class_="btn-primary"),
@@ -1610,8 +2233,10 @@ def server(input, output, session):
                 ui.output_ui("domain_warning"),
                 ui.input_radio_buttons(
                     "wse_mode", "Water surface (top boundary)",
-                    {"draw": "Wetted extent (auto / drawn)", "upload": "Upload a WSE raster"},
-                    selected="draw"),
+                    {"model": "Modeled — HEC-RAS 2D (Surface step)",
+                     "draw": "Wetted extent (auto / drawn)",
+                     "upload": "Upload a WSE raster"},
+                    selected=(wse_mode0 or "model")),
                 ui.panel_conditional(
                     "input.wse_mode === 'upload'",
                     ui.input_file("wse_upload", "WSE GeoTIFF", accept=[".tif", ".tiff"],
@@ -1631,7 +2256,44 @@ def server(input, output, session):
                     ui.input_text("g_right_profile", "Right profile", value="0,0.005 0.5,0.005 1,0.005"),
                     ui.div("Format: 'fraction,gradient …' along each boundary (must include 0 and 1).",
                            class_="hype-instr")),
-                ui.div(ui.input_action_button("next_boundaries", "Continue → K", class_="btn-primary"),
+                ui.div(ui.input_action_button("next_boundaries", "Continue → Surface",
+                                              class_="btn-primary"), class_="hype-actions"),
+            )
+        elif step == STEP_SURFACE:
+            with reactive.isolate():                   # prefill only; changes must not re-render
+                slope0 = ras_slope_default()
+            body = ui.TagList(
+                ui.div("Run a simplified HEC-RAS 2025 2D model over the domain: constant inflow "
+                       "upstream, normal-depth outflow downstream. The modeled wetted extent and "
+                       "water surface replace the drawn extent.", class_="hype-instr"),
+                ui.input_numeric("ras_flow", "Flow (cfs)", value=100.0, min=0.1, step=10.0),
+                ui.input_numeric("ras_slope", "Normal-depth friction slope",
+                                 value=round(slope0, 5) if slope0 else 0.001,
+                                 min=0.00001, step=0.0005),
+                ui.input_numeric("ras_n", "Manning's n", value=0.06, min=0.01, max=0.2, step=0.005),
+                ui.input_numeric("ras_cell", "Mesh cell size (m)", value=10.0, min=1.0, step=1.0),
+                ui.accordion(
+                    ui.accordion_panel(
+                        "Advanced",
+                        ui.input_select(
+                            "ras_engine_sel", "Engine",
+                            {"swe": "HEC-RAS 2025 — 2D Shallow Water (explicit, CPU)"},
+                            selected="swe"),
+                        ui.div("The only RAS 2025 engine that runs on Posit Connect Cloud "
+                               "(Linux): Diffusion Wave needs Intel MKL (Windows-only) and the "
+                               "GPU solver needs CUDA.", class_="hype-instr"),
+                        ui.input_numeric("ras_hours", "Simulation duration (hr)", value=6.0,
+                                         min=0.5, step=0.5),
+                        ui.input_numeric("ras_dt", "Compute timestep (s)", value=10.0,
+                                         min=0.1, step=1.0),
+                        ui.input_numeric("ras_out_min", "Output interval (min)", value=15.0,
+                                         min=1.0, step=5.0),
+                    ),
+                    open=False, id="ras_adv",
+                ),
+                ui.output_ui("ras_estimate"),
+                ui.output_ui("ras_controls"),      # Run/Cancel + live log + summary (re-renders freely)
+                ui.div(ui.input_action_button("next_surface", "Continue → K", class_="btn-primary"),
                        class_="hype-actions"),
             )
         elif step == STEP_K:
@@ -1735,8 +2397,7 @@ def server(input, output, session):
                        class_="hype-chk ok" if n >= 2 else "hype-chk")]
         if m:
             rows.append(ui.div(
-                f"Reach {m['length_m'] / 1609.344:.2f} mi · drainage area {m['da_sqkm']:.1f} km² · "
-                f"bankfull depth {m['depth_m']:.2f} m ({m['division_name']})",
+                f"Reach {m['length_m'] / 1609.344:.2f} mi · drainage area {m['da_sqkm']:.1f} km²",
                 class_="hype-estimate green"))
         return ui.div(*rows)
 
@@ -1756,7 +2417,7 @@ def server(input, output, session):
                 ("left", "Left FPL", LEFT_STYLE["color"], left_feat()),
                 ("right", "Right FPL", RIGHT_STYLE["color"], right_feat()),
                 ("down", "Downstream", DOWN_STYLE["color"], down_feat())]
-        if wse_mode_v() != "upload":
+        if wse_mode_v() == "draw":
             defs.append(("wse", "Water surface", WSE_STYLE["color"], wse_extent_feat()))
         rows = []
         for slot, label, color, feat in defs:
@@ -1823,6 +2484,14 @@ def server(input, output, session):
             return ui.p(f"✓ DEM — {tag}", class_="hype-chk ok")
 
     @render.ui
+    def dem_legend():
+        lohi = dem_lohi_v()
+        if dem_path() is None or not lohi:
+            return None
+        uri = results.colorbar_datauri(lohi[0], lohi[1], cmap="terrain", label="Elevation (m)")
+        return ui.img(src=uri, style="max-width:100%;height:auto;")
+
+    @render.ui
     def estimate_box():
         est = grid_estimate()
         if not est:
@@ -1835,17 +2504,152 @@ def server(input, output, session):
                    class_=f"hype-estimate {estimate.band(est['n_cells'])}"))
 
     @render.ui
+    def ras_estimate():
+        g = _domain_gdf_4326()
+        if g is None:
+            return None
+        try:
+            cell = float(_safe("ras_cell", 10.0))
+            prev = ras_mesh_prev()
+            if prev and abs(float(prev.get("cell_size_m", -1)) - cell) < 1e-9:
+                n, meshed = int(prev["cell_count"]), True    # real count from `ras mesh`
+            else:
+                n, meshed = ras_engine.estimate_cell_count(g, cell), False
+        except Exception:  # noqa: BLE001
+            return None
+        green, cap = ras_engine.cell_budget()
+        band = "green" if n <= green else ("amber" if n <= cap else "red")
+        lead = f"{n:,} mesh cells (meshed)" if meshed else f"≈ {n:,} mesh cells"
+        msg = (f"{lead} at {cell:g} m — "
+               + {"green": "quick run.", "amber": "will take a while on this server.",
+                  "red": f"over the {cap:,}-cell limit; increase the cell size."}[band])
+        return ui.div(msg, class_=f"hype-estimate {band}")
+
+    @render.ui
+    def ras_controls():
+        # Everything transient about the surface run lives here (NOT in leftpane) so re-renders
+        # never remount the parameter inputs above (which would reset them to their defaults).
+        running = ras_task.status() == "running"
+        meshing = mesh_prev_task.status() == "running"
+        res = ras_result()
+        if running:
+            return ui.TagList(
+                ui.output_ui("ras_run_head"),      # ticking progress bar — isolated re-render
+                ui.tags.pre(ui.output_text("ras_log"), class_="hype-log"),
+                ui.div(ui.input_action_button("cancel_surface", "Cancel",
+                                              class_="btn-sm btn-outline-danger"),
+                       class_="hype-actions"),
+            )
+        if meshing:
+            mesh_row = ui.div(ui.div(class_="hype-spinner"),
+                              ui.span("Meshing…", class_="hype-run-label"),
+                              class_="hype-run-head")
+        else:
+            mesh_row = ui.div(ui.input_action_button(
+                "ras_mesh_btn", "Compute mesh", class_="btn-sm btn-outline-secondary"),
+                class_="hype-actions")
+        parts = [
+            mesh_row,
+            ui.div(ui.input_action_button("run_surface", "Run surface model",
+                                          class_="btn-primary",
+                                          disabled=meshing), class_="hype-actions"),
+        ]
+        if res:
+            m = res.get("max_depth_m") or 0.0
+            n_parts = int(res.get("n_parts") or 0)
+            main_frac = float(res.get("main_frac") or 1.0)
+            pools = f" · {n_parts} parts" if n_parts > 1 else ""
+            parts.append(ui.div(
+                f"✓ Surface model complete — {res.get('n_cells', 0):,} cells · "
+                f"max depth {m:.2f} m · wetted area {res.get('wetted_area_m2', 0):,.0f} m²"
+                f"{pools} · {res.get('runtime_s', 0):.0f}s. The modeled water surface feeds "
+                f"the groundwater run.", class_="hype-chk ok"))
+            if main_frac < 0.9:
+                terr_res = float(res.get("terrain_res_m") or 0.0)
+                hint = (f"the {terr_res:.0f} m terrain is likely too coarse to resolve the "
+                        "channel — re-fetch the DEM at 1 m if available"
+                        if terr_res > 2.0 else
+                        "on fine terrain this can be real shallow/braided flow — try a "
+                        "smaller cell size or a higher flow if you expect a continuous "
+                        "surface")
+                parts.append(ui.div(
+                    f"⚠ Fragmented water surface: the largest connected area holds only "
+                    f"{main_frac:.0%} of the wetted area; {hint}.",
+                    class_="hype-estimate amber"))
+            with reactive.isolate():               # persisted control state; no re-render loops
+                view0 = ras_view_v() or "depth"
+                op0 = float(ras_opacity_v())
+            parts.append(ui.input_radio_buttons(
+                "ras_view", "Result layer",
+                {"depth": "Depth", "wse": "Water surface", "hide": "Hide"},
+                selected=view0, inline=True))
+            parts.append(ui.input_slider("ras_opacity", "Overlay opacity", min=0.0, max=1.0,
+                                         value=op0, step=0.05))
+            parts.append(ui.output_ui("ras_legend"))
+        elif ras_log_tick():
+            parts.append(ui.tags.pre(ui.output_text("ras_log"), class_="hype-log"))
+        return ui.TagList(*parts)
+
+    @render.ui
+    def ras_legend():
+        view = ras_view_v()
+        ov = _ras_overlays.get(view) if ras_result() else None
+        if not ov:
+            return None
+        uri = results.colorbar_datauri(ov["vmin"], ov["vmax"], cmap=ov["cmap"],
+                                       label=ov["label"])
+        return ui.img(src=uri, style="max-width:100%;height:auto;")
+
+    @render.ui
+    def ras_run_head():
+        secs = int(ras_elapsed()); mm, ss = secs // 60, secs % 60
+        stage = ras_stage() or "Running"
+        pct = ras_pct()
+        row = [ui.div(class_="hype-spinner"),
+               ui.span(stage, class_="hype-run-label"),
+               ui.span(f"{mm}:{ss:02d}", class_="hype-elapsed")]
+        if pct is None:                                # indeterminate stage (python steps)
+            bar = ui.div(ui.div(class_="hype-prog-bar indet"), class_="hype-prog")
+            label = None
+        else:
+            bar = ui.div(ui.div(class_="hype-prog-bar", style=f"width:{pct}%"),
+                         class_="hype-prog")
+            text = f"{pct}%"
+            if stage == "Computing" and pct >= 5:      # ETA only where %-of-simulated-time is linear
+                stage_elapsed = max(time.monotonic() - ras_stage_t0(), 0.1)
+                remain = int(stage_elapsed / pct * (100 - pct))
+                text += f" · about {remain // 60}:{remain % 60:02d} left"
+            label = ui.div(text, class_="hype-prog-label")
+        return ui.TagList(ui.div(*row, class_="hype-run-head"), bar, label)
+
+    @render.text
+    def ras_log():
+        ras_log_tick()
+        return "\n".join(ras_log_lines[-200:]) or "Starting…"
+
+    @render.ui
     def mesh_status():
         if mesh_task.status() == "running":
-            return ui.div(ui.div(class_="hype-spinner"), ui.span("Building 3D mesh…"),
-                          class_="hype-busy")
+            return ui.div(
+                ui.div(ui.div(class_="hype-spinner"), ui.span("Building 3D mesh…"),
+                       class_="hype-busy"),
+                ui.div(ui.input_action_button("mesh3d_cancel", "Cancel",
+                                              class_="btn-sm btn-outline-danger"),
+                       class_="hype-actions"),
+            )
         g = mesh_geom()
         if not g:
             return ui.p("Click Compute mesh to preview the grid in 3D.", class_="hype-chk")
         f = g.get("decimation", 1)
         note = "" if f == 1 else f" · shown at 1/{f} resolution"
+        extras = []
+        if g.get("boundaries"):
+            extras.append("boundary lines labeled")
+        if g.get("basemap"):
+            extras.append("aerial drape on top (slider in the 3D toolbar)")
+        tail = (" · " + ", ".join(extras)) if extras else ""
         return ui.p(f"✓ {g.get('nActiveFull', 0):,} active cells{note} — drag to orbit, "
-                    f"slider to slice.", class_="hype-chk ok")
+                    f"middle/right-drag to pan, slider to slice{tail}.", class_="hype-chk ok")
 
     @render.ui
     def mesh3d_style():

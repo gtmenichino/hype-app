@@ -10,13 +10,45 @@ id = "019f019d-998f-1edd-cf76-f3d4c9e3248e"
 dashboard_url = "https://connect.posit.cloud/gtmenichino/content/019f019d-998f-1edd-cf76-f3d4c9e3248e"
 direct_url = "https://019f019d-998f-1edd-cf76-f3d4c9e3248e.share.connect.posit.cloud"
 logs_url = "https://connect.posit.cloud/gtmenichino/content/019f019d-998f-1edd-cf76-f3d4c9e3248e/history"
-deployed_at = "2026-06-26T01:49:02.742Z"
-bundle_id = "019f019d-9993-d7f1-5307-a7a5a67ea73e"
+deployed_at = "2026-06-26T02:30:05.229Z"
+bundle_id = "019f01c3-0568-4644-a1c6-5fc36db9f81c"
 files = [
     ".posit/publish/deployments/deployment-GSHC.toml",
     ".posit/publish/hype-app-6E18.toml",
+    ".python-version",
     "app.py",
+    "bin/linux/mf6",
+    "bin/linux/mp7",
+    "hype_app/__init__.py",
+    "hype_app/bieger.py",
+    "hype_app/bundle.py",
+    "hype_app/data/physio_divisions.geojson",
+    "hype_app/delineate.py",
+    "hype_app/dem.py",
+    "hype_app/estimate.py",
+    "hype_app/geometry.py",
+    "hype_app/hydro.py",
+    "hype_app/results.py",
+    "hype_app/run.py",
+    "hypetool/__init__.py",
+    "hypetool/__main__.py",
+    "hypetool/cli/__init__.py",
+    "hypetool/cli/main.py",
+    "hypetool/core/logging_bridge.py",
+    "hypetool/core/run_from_yaml.py",
+    "hypetool/core/run_headless.py",
+    "hypetool/data/templates/inputs_TEMPLATE.yaml",
+    "hypetool/functions/__init__.py",
+    "hypetool/functions/model_utils.py",
+    "hypetool/functions/my_utils.py",
+    "hypetool/functions/path_utils.py",
+    "hypetool/functions/raster_utils.py",
+    "hypetool/functions/runners.py",
+    "hypetool/functions/wse_utils.py",
+    "hypetool/inputs.py",
+    "hypetool/requirements.txt",
     "requirements.txt",
+    "www/styles.css",
 ]
 requirements = [
     "shiny>=1.2",
@@ -40,6 +72,7 @@ requirements = [
     "PyYAML>=6.0",
     "pydantic>=2",
     "matplotlib>=3.8",
+    "seaborn>=0.12",
 ]
 
 [connect_cloud]
@@ -53,6 +86,11 @@ title = "hype-app"
 files = [
     "/app.py",
     "/requirements.txt",
+    "/.python-version",
+    "/hype_app/**",
+    "/hypetool/**",
+    "/bin/linux/**",
+    "/www/**",
     "/.posit/publish/hype-app-6E18.toml",
     "/.posit/publish/deployments/deployment-GSHC.toml",
 ]
@@ -60,10 +98,5 @@ validate = true
 product_type = "connect_cloud"
 
 [configuration.python]
-version = "3.11"
-
-[deployment_error]
-code = "deployFailed"
-message = "Runtime error: Unable to start the app due to a runtime error. Please check the logs for more information."
-operation = "publish"
+version = "3.12"
 

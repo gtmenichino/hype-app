@@ -37,11 +37,54 @@ def _candidate_resolutions(aoi_bounds, requested) -> list:
     return order
 
 
+_IMAGESERVER = ("https://elevation.nationalmap.gov/arcgis/rest/services/"
+                "3DEPElevation/ImageServer/exportImage")
+_IMAGESERVER_MAX_SIDE = 4000        # the service caps exports around 4100 px per side
+
+
+def _fetch_imageserver(aoi_bounds4326, res_m, out_path, w_m, h_m):
+    """Direct 3DEP fetch via the ArcGIS ImageServer with plain urllib.
+
+    py3dep's fine-resolution (1/3/5 m) path goes through aiohttp, whose async DNS
+    resolver can fail on hosts the system resolver handles fine — observed as
+    'Cannot connect to host elevation.nationalmap.gov' while urllib requests to the
+    SAME host succeed. This fallback keeps 1 m lidar reachable in that situation
+    (losing it silently degrades every downstream surface — RAS property tables,
+    result rasters, wetted extent). Raises on failure; validates that the returned
+    tile actually contains data (the server answers all-nodata where a collection
+    has no coverage)."""
+    import shutil
+    import urllib.parse
+    import urllib.request
+
+    import numpy as np
+    import rasterio
+
+    w_px, h_px = round(w_m / res_m), round(h_m / res_m)
+    if max(w_px, h_px) > _IMAGESERVER_MAX_SIDE:
+        raise RuntimeError(f"AOI too large for a single ImageServer export at {res_m} m")
+    minx, miny, maxx, maxy = aoi_bounds4326
+    params = urllib.parse.urlencode({
+        "bbox": f"{minx},{miny},{maxx},{maxy}", "bboxSR": 4326, "imageSR": 5070,
+        "size": f"{w_px},{h_px}", "format": "tiff", "pixelType": "F32",
+        "noData": -9999, "interpolation": "RSP_BilinearInterpolation", "f": "image"})
+    with urllib.request.urlopen(f"{_IMAGESERVER}?{params}", timeout=180) as r, \
+            open(out_path, "wb") as f:
+        shutil.copyfileobj(r, f)
+    with rasterio.open(out_path) as ds:
+        a = ds.read(1, masked=True)
+        valid = int((~a.mask).sum()) if np.ma.isMaskedArray(a) else a.size
+    if valid < 0.01 * w_px * h_px:
+        raise RuntimeError(f"ImageServer returned no data at {res_m} m (collection gap)")
+    return str(out_path)
+
+
 def fetch_dem(domain_gdf_4326, out_path, resolution="auto", buffer_frac: float = BUFFER_FRAC):
     """Download the finest available USGS 3DEP DEM over the domain bbox (+buffer) and write it to
     `out_path` as a GeoTIFF. `resolution` is ``"auto"`` (finest 3DEP available — 1 m where lidar
     exists) or an explicit metre value (1/3/5/10/30). Resolutions whose request would exceed the
-    3DEP pixel cap are skipped, and the fetch falls back to coarser data on any failure. Returns
+    3DEP pixel cap are skipped; each fine resolution is tried via py3dep first and then via the
+    ImageServer directly (see _fetch_imageserver) before falling back to coarser data. Returns
     ``{"path", "resolution_m", "source"}``."""
     import geopandas as gpd
 
@@ -64,7 +107,15 @@ def fetch_dem(domain_gdf_4326, out_path, resolution="auto", buffer_frac: float =
             dem.rio.to_raster(out_path)
             return {"path": str(out_path), "resolution_m": int(res), "source": "USGS 3DEP"}
         except Exception as e:  # noqa: BLE001
-            errors.append((res, str(e)[:140])); continue
+            errors.append((res, str(e)[:140]))
+        if res <= 5:                       # dynamic-service resolutions: try urllib directly
+            try:
+                _fetch_imageserver(aoi.bounds, res, out_path, w_m, h_m)
+                return {"path": str(out_path), "resolution_m": int(res),
+                        "source": "USGS 3DEP"}
+            except Exception as e:  # noqa: BLE001
+                errors.append((res, "imageserver: " + str(e)[:120]))
+        continue
     raise RuntimeError(f"3DEP DEM fetch failed at all candidate resolutions: {errors}")
 
 
@@ -140,10 +191,14 @@ def rgba_to_overlay(rgba, xs, ys) -> dict:
             "bounds": [[float(ys.min()), float(xs.min())], [float(ys.max()), float(xs.max())]]}
 
 
-def dem_overlay(dem_path, *, max_dim: int = 1024) -> dict:
+def dem_overlay(dem_path, *, max_dim: int = 1024, vert_exag: float = 2.0,
+                vmin: float | None = None, vmax: float | None = None) -> dict:
     """Render the DEM as a hillshade + elevation-tint RGBA PNG (transparent at nodata) for an
     ipyleaflet ImageOverlay — lets the user toggle terrain vs. aerial while tracing the wetted
-    extent. Returns {"url": <base64 data URI>, "bounds": [[s, w], [n, e]]} in EPSG:4326."""
+    extent. `vert_exag` scales the hillshade relief (0 disables shading → flat color tint);
+    `vmin`/`vmax` pin the color stretch (e.g. to the current map view) — when omitted the
+    2–98 % percentiles of the whole raster are used. Returns {"url": <base64 data URI>,
+    "bounds": [[s, w], [n, e]], "vmin", "vmax"} in EPSG:4326."""
     import numpy as np
     from matplotlib import cm
     from matplotlib.colors import LightSource, Normalize
@@ -152,14 +207,44 @@ def dem_overlay(dem_path, *, max_dim: int = 1024) -> dict:
     valid = np.isfinite(z)
     if not valid.any():
         raise ValueError("DEM has no valid pixels to render.")
-    lo, hi = (float(v) for v in np.nanpercentile(z[valid], [2, 98]))
+    if vmin is None or vmax is None:
+        vmin, vmax = (float(v) for v in np.nanpercentile(z[valid], [2, 98]))
+    if not vmax > vmin:
+        vmax = vmin + 1.0
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    zfill = np.where(valid, z, vmin)
+    if vert_exag > 0:
+        ls = LightSource(azdeg=315, altdeg=45)
+        rgba = ls.shade(zfill, cmap=cm.terrain, blend_mode="soft",
+                        norm=norm, vert_exag=float(vert_exag), dx=dx, dy=dy)
+    else:                                  # shading off: plain elevation tint
+        rgba = cm.terrain(norm(np.clip(zfill, vmin, vmax)))
+    rgba[..., 3] = valid.astype(float)     # transparent at nodata
+    ov = rgba_to_overlay(rgba, xs, ys)
+    ov.update(vmin=float(vmin), vmax=float(vmax))
+    return ov
+
+
+def stretch_for_bounds(dem_path, bounds_wsen) -> tuple[float, float] | None:
+    """(vmin, vmax) = 2–98 % elevation percentiles INSIDE the given EPSG:4326 view bounds
+    (west, south, east, north) — the "recalculate legend from the current view" stretch.
+    None when the view contains no valid terrain."""
+    import numpy as np
+
+    z, xs, ys, _dx, _dy = load_raster_4326(dem_path)
+    w, s, e, n = (float(v) for v in bounds_wsen)
+    ix = (xs >= w) & (xs <= e)
+    iy = (ys >= s) & (ys <= n)            # ys is north-up (descending); mask handles order
+    if not ix.any() or not iy.any():
+        return None
+    sub = z[np.ix_(iy, ix)]
+    sub = sub[np.isfinite(sub)]
+    if sub.size < 4:
+        return None
+    lo, hi = (float(v) for v in np.percentile(sub, [2, 98]))
     if not hi > lo:
         hi = lo + 1.0
-    ls = LightSource(azdeg=315, altdeg=45)
-    rgba = ls.shade(np.where(valid, z, lo), cmap=cm.terrain, blend_mode="soft",
-                    norm=Normalize(vmin=lo, vmax=hi), vert_exag=2.0, dx=dx, dy=dy)
-    rgba[..., 3] = valid.astype(float)     # transparent at nodata
-    return rgba_to_overlay(rgba, xs, ys)
+    return lo, hi
 
 
 def dem_summary(out_path) -> dict:

@@ -165,11 +165,17 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
   font-size: 12px; color: var(--hype-text); max-width: calc(100% - 372px); }
 .hype-mesh3d-bar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; font-weight: 500; }
 .hype-mesh3d-bar input[type="range"] { width: 120px; }
+.hype-mesh3d-bar input[type="number"] { width: 74px; font-size: 12px; padding: 2px 5px;
+  border: 1px solid var(--hype-card-border); border-radius: 5px; }
 .hype-mesh3d-bar select, .hype-mesh3d-bar button { font-size: 12px; padding: 3px 8px;
   border: 1px solid var(--hype-card-border); background: #fff; border-radius: 5px; cursor: pointer; }
 .hype-mesh3d-bar button:hover { background: var(--hype-surface-soft); }
 .hype-mesh3d-hint { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
   z-index: 505; color: #9fb0c3; font-size: 14px; text-align: center; pointer-events: none; }
+.hype-mesh3d-label { position: absolute; z-index: 508; transform: translate(-50%, -130%);
+  pointer-events: none; white-space: nowrap; font-size: 11px; font-weight: 600;
+  padding: 2px 8px; border-radius: 10px; background: rgba(13, 17, 23, .78);
+  border: 1px solid currentColor; }
 
 /* ---- busy / spinner ---- */
 .hype-busy { display: flex; align-items: center; gap: 8px; color: var(--hype-accent); font-size: 13px; margin: 10px 0; }
@@ -203,3 +209,5 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-prog-bar { height: 100%; background: var(--hype-accent); border-radius: 5px; transition: width .4s ease; }
 .hype-prog-bar.indet { width: 35%; animation: hype-indet 1.2s ease-in-out infinite; }
 @keyframes hype-indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.hype-prog-label { font-size: 12px; color: var(--hype-muted); margin-top: 4px;
+                   font-variant-numeric: tabular-nums; }

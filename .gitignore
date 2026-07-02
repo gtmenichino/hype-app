@@ -7,10 +7,15 @@ venv/
 # local HyRiver / aiohttp request cache (dev only; Connect Cloud caches to /tmp)
 cache/
 *.sqlite
-# per-session model scratch (never commit run output)
+# per-session model scratch (never commit run output) — anchored to the repo root so the
+# bundled RAS template's Results/ folder stays committable
 /tmp/
-results/
-output/
+/results/
+/output/
 *.hds
 *.cbb
 *.mppth
+# local reference material (HEC-RAS 2025 install + decompile + template source) —
+# 400+ MB of installed software; the app bundles only what it needs (hype_app/data/ras_template,
+# bin/ras2025)
+/reference/

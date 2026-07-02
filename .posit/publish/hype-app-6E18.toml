@@ -12,6 +12,7 @@ files = [
     "/hype_app/**",
     "/hypetool/**",
     "/bin/linux/**",
+    "/bin/ras2025/**",
     "/www/**",
     "/.posit/publish/hype-app-6E18.toml",
     "/.posit/publish/deployments/deployment-GSHC.toml",

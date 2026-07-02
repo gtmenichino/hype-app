@@ -31,6 +31,11 @@ tabulate>=0.9
 PyYAML>=6.0
 pydantic>=2
 
+# --- HEC-RAS 2025 surface-water model (Surface step) ---
+# h5py edits the bundled RAS template project (geometry arcs, boundary conditions, plan);
+# the solver itself is the bundled .NET CLI at bin/ras2025 (no Python binding needed).
+h5py>=3.11
+
 # --- Figures (the engine imports these at module level even when make_figures=False) ---
 matplotlib>=3.8
 seaborn>=0.12

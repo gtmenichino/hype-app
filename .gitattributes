@@ -2,3 +2,8 @@
 # track them with Git LFS so the repo stays lean. They have no file extension,
 # so match by path.
 bin/linux/** filter=lfs diff=lfs merge=lfs -text
+# Bundled HEC-RAS 2025 Linux runtime (~265 MB: .NET runtime, managed engine DLLs,
+# HDF5 + GDAL natives). Everything under it is binary — LFS by path. The provenance
+# manifest stays plain text.
+bin/ras2025/** filter=lfs diff=lfs merge=lfs -text
+bin/ras2025/MANIFEST.md -filter -diff -merge text

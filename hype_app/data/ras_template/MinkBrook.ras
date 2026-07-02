@@ -1,0 +1,9 @@
+﻿<Project>
+  <Projection Type="EPSG">3445</Projection>
+  <PlanAssociations>
+    <PlanAssociation Plan="Plan" Geometry="Geometry" BoundaryCondition="Boundary Condition" />
+  </PlanAssociations>
+  <GeometryAssociations>
+    <GeometryAssociation Geometry="Geometry" Terrain="Terrain" N_Values="N Values" />
+  </GeometryAssociations>
+</Project>

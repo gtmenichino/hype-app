@@ -28,7 +28,7 @@ EXE = "mf6.exe" if sys.platform.startswith("win") else "mf6"
 # wheels resolve on Connect Cloud.
 STACK = ["shiny", "shinywidgets", "ipyleaflet", "flopy", "numpy", "scipy", "pandas",
          "geopandas", "shapely", "pyproj", "rasterio", "rioxarray", "xarray",
-         "netCDF4", "skimage", "pydantic", "py3dep"]
+         "netCDF4", "skimage", "pydantic", "py3dep", "h5py"]
 
 
 def _chmodx(p: Path) -> None:
@@ -56,6 +56,26 @@ def _mf6_version() -> str:
         return f"exit={r.returncode}\n{(r.stdout or '').strip()}\n{(r.stderr or '').strip()}".strip()
     except Exception as e:  # noqa: BLE001
         return f"FAILED to execute {mf6}: {type(e).__name__}: {e}"
+
+
+def _ras_healthcheck() -> str:
+    """Run the bundled HEC-RAS 2025 CLI's healthcheck (dotnet runtime + GDAL natives +
+    PROJ data + reprojection). SUCCESS here means the Surface step's solver can run."""
+    try:
+        from hype_app import ras
+        if not ras.ras_available():
+            return ("SKIPPED — no RAS runtime found (bin/ras2025 missing and HYPE_RAS_BIN "
+                    "unset). The Surface step will be unavailable.")
+        ras.prepare_linux_bundle()
+        cmd, env = ras.ras_cmd()
+        r = subprocess.run(cmd + ["healthcheck"], capture_output=True, text=True,
+                           timeout=180, env=env)
+        tail = "\n".join((r.stdout or "").strip().splitlines()[-4:])
+        ok = r.returncode == 0 and "healthcheck passed" in (r.stdout or "")
+        return (f"{'SUCCESS — ' if ok else 'FAILED — '}exit={r.returncode}\n{tail}\n"
+                f"{(r.stderr or '').strip()[-400:]}").strip()
+    except Exception:  # noqa: BLE001
+        return "EXCEPTION:\n" + traceback.format_exc()
 
 
 def _tiny_mf6_solve() -> str:
@@ -101,6 +121,8 @@ app_ui = ui.page_fillable(
     ui.output_text_verbatim("mfver"),
     ui.tags.h4("Tiny MODFLOW 6 solve"),
     ui.output_text_verbatim("solve"),
+    ui.tags.h4("HEC-RAS 2025 healthcheck (bin/ras2025 — Surface step)"),
+    ui.output_text_verbatim("rascheck"),
     title="Hyporheic smoke test",
 )
 
@@ -120,6 +142,7 @@ def server(input, output, session):
                 "imports": _imports_report(),
                 "mfver": _mf6_version(),
                 "solve": _tiny_mf6_solve(),
+                "rascheck": _ras_healthcheck(),
             }
         return await anyio.to_thread.run_sync(_work)
 
@@ -165,6 +188,10 @@ def server(input, output, session):
     @render.text
     def solve():
         return (res() or {}).get("solve", "")
+
+    @render.text
+    def rascheck():
+        return (res() or {}).get("rascheck", "")
 
 
 app = App(app_ui, server)
